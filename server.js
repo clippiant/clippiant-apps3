@@ -242,59 +242,17 @@ function normalizeScenes(project) {
 }
 
 function buildSceneVideoPrompt(scene, sceneIndex, totalScenes) {
-  const positionHint =
-    sceneIndex === 0
-      ? "This is the opening scene of the video."
-      : sceneIndex === totalScenes - 1
-      ? "This is the closing scene of the video."
-      : "This scene should feel like a natural continuation of the surrounding scenes.";
-
-  const dialogueText = Array.isArray(scene?.dialogue)
-    ? scene.dialogue
-        .filter((line) => typeof line?.text === "string" && line.text.trim())
-        .map((line, idx) => {
-          const speaker = line.speaker || `Speaker ${idx + 1}`;
-          return `${speaker}: "${line.text}"`;
-        })
-        .join("\n")
-    : "";
-
-  const sfxText = Array.isArray(scene?.sound_effects)
-    ? scene.sound_effects
-        .filter((fx) => typeof fx?.prompt === "string" && fx.prompt.trim())
-        .map((fx) => `- ${fx.prompt}`)
-        .join("\n")
-    : "";
-
-  return [
-    "Create a cinematic AI video shot.",
-    "This should feel like a real video clip, not a slideshow, not a storyboard, and not a sequence of still images.",
-    "If a visible character speaks, their lip movements and facial performance should match the spoken line as closely as the model allows.",
-    "If an on-screen action creates a sound, the timing of that sound should feel aligned with the action.",
-    "",
-    `SCENE TITLE: ${scene.title || ""}`,
-    `BASE SCENE: ${scene.base_prompt || ""}`,
-    `CONTINUITY RULES: ${scene.continuity_rules || ""}`,
-    `POSITION IN VIDEO: Scene ${sceneIndex + 1} of ${totalScenes}`,
-    `POSITION HINT: ${positionHint}`,
-    scene.narration ? `SCENE CONTEXT: ${scene.narration}` : "",
-    "",
-    "DIALOGUE:",
-    dialogueText || "No spoken dialogue.",
-    "",
-    "SOUND EFFECTS / ACTION AUDIO:",
-    sfxText || "- natural ambient audio only",
-    "",
-    "Requirements:",
-    "- cinematic composition",
-    "- coherent natural motion",
-    "- stable subject identity",
-    "- stable environment",
-    "- stable lighting and palette",
-    "- no subtitles or on-screen text",
+  const parts = [
+    `Scene ${sceneIndex + 1} of ${totalScenes}.`,
+    scene?.base_prompt || "",
+    scene?.continuity_rules || "",
+    scene?.narration ? `Context: ${scene.narration}` : "",
+    "Cinematic, realistic motion, stable subjects, stable lighting, no subtitles or on-screen text."
   ]
     .filter(Boolean)
-    .join("\n");
+    .join(" ");
+
+  return parts.slice(0, 1000);
 }
 
 function getNarrationText(project, scenes) {
@@ -366,13 +324,13 @@ async function generateSceneVideoWithRunway({
     throw new Error("Runway provider not configured");
   }
 
-  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
+  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes).slice(0, 1000);
   const duration = Math.max(4, Math.min(10, normalizeVideoSeconds(scene.duration_seconds)));
 
-  const taskStart = await runway.imageToVideo.create({
+  const taskStart = await runway.textToVideo.create({
     model: RUNWAY_MODEL,
     promptText: prompt,
-    ratio: RUNWAY_RATIO,
+    ratio: "1280:720",
     duration,
   });
 
