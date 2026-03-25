@@ -394,20 +394,44 @@ function extractRunwayVideoUrl(task) {
   );
 }
 
+async function waitForRunwayTask(taskId, maxAttempts = 120, delayMs = 5000) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const task = await runway.tasks.retrieve(taskId);
+
+    if (task?.status === "SUCCEEDED") {
+      return task;
+    }
+
+    if (task?.status === "FAILED" || task?.status === "CANCELED") {
+      throw new Error(
+        `Runway task failed with status ${task.status}: ${JSON.stringify(task)}`
+      );
+    }
+
+    await sleep(delayMs);
+  }
+
+  throw new Error("Runway task polling timed out");
+}
+
 async function generateSceneVideoWithRunway({ scene, sceneIndex, totalScenes, outputPath }) {
   if (!runway) throw new Error("Runway provider not configured");
 
   const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
   const duration = Math.max(5, Math.min(10, Number(scene.duration_seconds) || 5));
 
-  const taskRequest = runway.imageToVideo.create({
+  const taskStart = await runway.imageToVideo.create({
     model: RUNWAY_MODEL,
     promptText: prompt,
     ratio: RUNWAY_RATIO,
     duration,
   });
 
-  const task = await taskRequest.waitForTaskOutput();
+  if (!taskStart?.id) {
+    throw new Error(`Runway did not return a task id: ${JSON.stringify(taskStart)}`);
+  }
+
+  const task = await waitForRunwayTask(taskStart.id);
 
   const videoUrl =
     task?.output?.[0] ||
@@ -418,7 +442,7 @@ async function generateSceneVideoWithRunway({ scene, sceneIndex, totalScenes, ou
     null;
 
   if (!videoUrl) {
-    throw new Error("Runway completed without a usable output URL");
+    throw new Error(`Runway completed without a usable output URL: ${JSON.stringify(task)}`);
   }
 
   await downloadToFile(videoUrl, outputPath);
