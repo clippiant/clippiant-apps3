@@ -1,5 +1,4 @@
 import express from "express";
-import "dotenv/config";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -7,54 +6,37 @@ import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import RunwayML from "@runwayml/sdk";
-import { fal } from "@fal-ai/client";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-const WORKER_SECRET = process.env.WORKER_SECRET;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const PORT = process.env.PORT || 3000;
+const WORKER_SECRET = process.env.WORKER_SECRET || "";
 
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const RUNWAYML_API_SECRET = process.env.RUNWAYML_API_SECRET || "";
-const FAL_KEY = process.env.FAL_KEY || "";
+
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
 const DEFAULT_SCENE_SECONDS = Number(process.env.DEFAULT_SCENE_SECONDS || "4");
-const MAX_SCENES_PER_EXPORT = Number(process.env.MAX_SCENES_PER_EXPORT || "4");
+const MAX_SCENES_PER_EXPORT = Number(process.env.MAX_SCENES_PER_EXPORT || "8");
 
 const RUNWAY_MODEL = process.env.RUNWAY_MODEL || "gen4.5";
-const RUNWAY_RATIO = process.env.RUNWAY_RATIO || "1920:1080";
+const RUNWAY_RATIO = process.env.RUNWAY_RATIO || "1280:720";
 
-const PIKA_ENDPOINT =
-  process.env.PIKA_ENDPOINT || "fal-ai/pika/v2.1/text-to-video";
-const PIKA_ASPECT_RATIO = process.env.PIKA_ASPECT_RATIO || "16:9";
-const PIKA_RESOLUTION = process.env.PIKA_RESOLUTION || "1080p";
-
-const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
-const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
-const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
-const ENABLE_SUBTITLES = String(process.env.ENABLE_SUBTITLES || "false") === "true";
+const ENABLE_SUBTITLES =
+  String(process.env.ENABLE_SUBTITLES || "false") === "true";
 
 const ENABLE_GENERATED_SFX =
   String(process.env.ENABLE_GENERATED_SFX || "true") === "true";
 
-const PROVIDER_CONFIG = {
-  video: {
-    primary: "runway",
-    fallback: null,
-  },
-  voice: {
-    primary: "openai",
-    fallback: "elevenlabs",
-  },
-  sfx: {
-    primary: "elevenlabs",
-    fallback: "internal",
-  },
-};
+const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
+const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
+const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -66,21 +48,22 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-if (!RUNWAYML_API_SECRET && !FAL_KEY) {
-  console.error("At least one video provider key is required: RUNWAYML_API_SECRET or FAL_KEY");
+if (!RUNWAYML_API_SECRET) {
+  console.error("Missing RUNWAYML_API_SECRET");
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const runway = new RunwayML({ apiKey: RUNWAYML_API_SECRET });
 
-const runway = RUNWAYML_API_SECRET
-  ? new RunwayML({ apiKey: RUNWAYML_API_SECRET })
-  : null;
-
-if (FAL_KEY) {
-  fal.config({ credentials: FAL_KEY });
-}
+console.log("RUNWAY ENV CHECK:", {
+  hasRunwaySecret: Boolean(process.env.RUNWAYML_API_SECRET),
+  runwaySecretPrefix: process.env.RUNWAYML_API_SECRET
+    ? process.env.RUNWAYML_API_SECRET.slice(0, 4)
+    : null,
+});
+console.log("RUNWAY CLIENT AVAILABLE:", Boolean(runway));
 
 function requireSecret(req, res) {
   if (!WORKER_SECRET) {
@@ -94,6 +77,10 @@ function requireSecret(req, res) {
   }
 
   return false;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function runProcess(command, args) {
@@ -125,10 +112,6 @@ function runProcess(command, args) {
 
 function runFfmpeg(args) {
   return runProcess("ffmpeg", args);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function getMediaDuration(filePath) {
@@ -170,6 +153,16 @@ async function checkIfVideoHasAudio(filePath) {
   }
 }
 
+async function downloadToFile(url, outputPath) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to download file: ${res.status}`);
+  }
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
+}
+
 async function updateExport(exportId, values) {
   const { error } = await supabase.from("exports").update(values).eq("id", exportId);
   if (error) {
@@ -191,6 +184,21 @@ function normalizeVideoSeconds(value) {
   return 4;
 }
 
+function stableHash(str) {
+  let hash = 0;
+  const input = String(str || "");
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function selectOpenAIVoiceForSpeaker(speaker) {
+  const voices = ["alloy", "echo", "fable", "nova", "onyx", "shimmer"];
+  const index = stableHash(speaker || "default") % voices.length;
+  return voices[index];
+}
+
 function normalizeScenes(project) {
   const rawScenes = Array.isArray(project?.scenes) ? project.scenes : [];
 
@@ -210,32 +218,27 @@ function normalizeScenes(project) {
     ];
   }
 
-  return rawScenes.map((scene, sceneIndex) => {
-    return {
-      title: scene?.title || `Scene ${sceneIndex + 1}`,
-      narration:
-        typeof scene?.narration === "string"
-          ? scene.narration
-          : typeof scene?.voiceover === "string"
-          ? scene.voiceover
-          : typeof scene?.text === "string"
-          ? scene.text
-          : "",
-      base_prompt:
-        scene?.base_prompt ||
-        scene?.visual ||
-        `A cinematic realistic video scene for ${scene?.title || `scene ${sceneIndex + 1}`}.`,
-      continuity_rules:
-        scene?.continuity_rules ||
-        "Continue naturally from the previous scene. Keep the same subjects, environment, lighting, style, and motion continuity unless explicitly changed.",
-      duration_seconds: toPositiveInt(
-        scene?.duration_seconds,
-        DEFAULT_SCENE_SECONDS
-      ),
-      dialogue: Array.isArray(scene?.dialogue) ? scene.dialogue : [],
-      sound_effects: Array.isArray(scene?.sound_effects) ? scene.sound_effects : [],
-    };
-  });
+  return rawScenes.map((scene, sceneIndex) => ({
+    title: scene?.title || `Scene ${sceneIndex + 1}`,
+    narration:
+      typeof scene?.narration === "string"
+        ? scene.narration
+        : typeof scene?.voiceover === "string"
+        ? scene.voiceover
+        : typeof scene?.text === "string"
+        ? scene.text
+        : "",
+    base_prompt:
+      scene?.base_prompt ||
+      scene?.visual ||
+      `A cinematic realistic video scene for ${scene?.title || `scene ${sceneIndex + 1}`}.`,
+    continuity_rules:
+      scene?.continuity_rules ||
+      "Continue naturally from the previous scene. Keep the same subjects, environment, lighting, style, and motion continuity unless explicitly changed.",
+    duration_seconds: toPositiveInt(scene?.duration_seconds, DEFAULT_SCENE_SECONDS),
+    dialogue: Array.isArray(scene?.dialogue) ? scene.dialogue : [],
+    sound_effects: Array.isArray(scene?.sound_effects) ? scene.sound_effects : [],
+  }));
 }
 
 function buildSceneVideoPrompt(scene, sceneIndex, totalScenes) {
@@ -328,83 +331,22 @@ function shouldGenerateDialogue(audioMode) {
   return audioMode === "dialogue" || audioMode === "both";
 }
 
-function stableHash(str) {
-  let hash = 0;
-  const input = String(str || "");
-  for (let i = 0; i < input.length; i++) {
-    hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
-  }
-  return hash;
-}
-
-function selectOpenAIVoiceForSpeaker(speaker) {
-  const voices = ["alloy", "echo", "fable", "nova", "onyx", "shimmer"];
-  const index = stableHash(speaker || "default") % voices.length;
-  return voices[index];
-}
-
-function chooseVideoProvider() {
-  if (PROVIDER_CONFIG.video.primary === "runway") {
-    if (!runway) {
-      throw new Error("Runway is configured as primary but is not available");
-    }
-    return "runway";
-  }
-
-  if (PROVIDER_CONFIG.video.primary === "pika") {
-    if (!FAL_KEY) {
-      throw new Error("Pika is configured as primary but is not available");
-    }
-    return "pika";
-  }
-
-  throw new Error("No valid primary video provider configured");
-}
-
-function chooseVoiceProvider() {
-  if (PROVIDER_CONFIG.voice.primary === "openai" && OPENAI_API_KEY) return "openai";
-  if (PROVIDER_CONFIG.voice.primary === "elevenlabs" && ELEVENLABS_API_KEY) return "elevenlabs";
-  if (PROVIDER_CONFIG.voice.fallback === "openai" && OPENAI_API_KEY) return "openai";
-  if (PROVIDER_CONFIG.voice.fallback === "elevenlabs" && ELEVENLABS_API_KEY) return "elevenlabs";
-  throw new Error("No configured voice provider is available");
-}
-
-function chooseSfxProvider() {
-  if (PROVIDER_CONFIG.sfx.primary === "elevenlabs" && ELEVENLABS_API_KEY) return "elevenlabs";
-  return "internal";
-}
-
-async function downloadToFile(url, outputPath) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Failed to download file: ${res.status}`);
-  }
-  const buffer = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(outputPath, buffer);
-}
-
-function extractRunwayVideoUrl(task) {
-  return (
-    task?.output?.[0] ||
-    task?.output?.video ||
-    task?.output?.video_url ||
-    task?.video_url ||
-    task?.url ||
-    null
-  );
+function normalizeRunwayStatus(task) {
+  return String(task?.status || "").toUpperCase();
 }
 
 async function waitForRunwayTask(taskId, maxAttempts = 120, delayMs = 5000) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const task = await runway.tasks.retrieve(taskId);
+    const status = normalizeRunwayStatus(task);
 
-    if (task?.status === "SUCCEEDED") {
+    if (status === "SUCCEEDED" || status === "SUCCESS" || status === "COMPLETED") {
       return task;
     }
 
-    if (task?.status === "FAILED" || task?.status === "CANCELED") {
+    if (status === "FAILED" || status === "CANCELED" || status === "CANCELLED") {
       throw new Error(
-        `Runway task failed with status ${task.status}: ${JSON.stringify(task)}`
+        `Runway task failed with status ${status}: ${JSON.stringify(task)}`
       );
     }
 
@@ -414,30 +356,42 @@ async function waitForRunwayTask(taskId, maxAttempts = 120, delayMs = 5000) {
   throw new Error("Runway task polling timed out");
 }
 
-async function generateSceneVideoWithPika({ scene, sceneIndex, totalScenes, outputPath }) {
-  if (!FAL_KEY) throw new Error("Pika/Fal provider not configured");
+async function generateSceneVideoWithRunway({
+  scene,
+  sceneIndex,
+  totalScenes,
+  outputPath,
+}) {
+  if (!runway) {
+    throw new Error("Runway provider not configured");
+  }
 
   const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
-  const duration = Math.max(5, Math.min(10, Number(scene.duration_seconds) || 5));
+  const duration = Math.max(4, Math.min(10, normalizeVideoSeconds(scene.duration_seconds)));
 
-  const result = await fal.subscribe(PIKA_ENDPOINT, {
-    input: {
-      prompt,
-      aspect_ratio: PIKA_ASPECT_RATIO,
-      resolution: PIKA_RESOLUTION,
-      duration,
-    },
-    logs: true,
+  const taskStart = await runway.imageToVideo.create({
+    model: RUNWAY_MODEL,
+    promptText: prompt,
+    ratio: RUNWAY_RATIO,
+    duration,
   });
 
+  if (!taskStart?.id) {
+    throw new Error(`Runway did not return a task id: ${JSON.stringify(taskStart)}`);
+  }
+
+  const task = await waitForRunwayTask(taskStart.id);
+
   const videoUrl =
-    result?.data?.video?.url ||
-    result?.data?.videos?.[0]?.url ||
-    result?.video?.url ||
+    task?.output?.[0] ||
+    task?.output?.video ||
+    task?.output?.video_url ||
+    task?.video_url ||
+    task?.url ||
     null;
 
   if (!videoUrl) {
-    throw new Error("Pika completed without a usable output URL");
+    throw new Error(`Runway completed without a usable output URL: ${JSON.stringify(task)}`);
   }
 
   await downloadToFile(videoUrl, outputPath);
@@ -445,56 +399,12 @@ async function generateSceneVideoWithPika({ scene, sceneIndex, totalScenes, outp
 }
 
 async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }) {
-  const primary = chooseVideoProvider();
-  const fallback = PROVIDER_CONFIG.video.fallback;
-
-  try {
-    if (primary === "runway") {
-      return await generateSceneVideoWithRunway({
-        scene,
-        sceneIndex,
-        totalScenes,
-        outputPath,
-      });
-    }
-
-    if (primary === "pika") {
-      return await generateSceneVideoWithPika({
-        scene,
-        sceneIndex,
-        totalScenes,
-        outputPath,
-      });
-    }
-
-    throw new Error(`Unknown primary video provider: ${primary}`);
-  } catch (primaryErr) {
-    console.error(`Primary video provider ${primary} failed:`, primaryErr?.message || primaryErr);
-
-    if (!fallback) {
-      throw primaryErr;
-    }
-
-    if (fallback === "runway" && runway) {
-      return await generateSceneVideoWithRunway({
-        scene,
-        sceneIndex,
-        totalScenes,
-        outputPath,
-      });
-    }
-
-    if (fallback === "pika" && FAL_KEY) {
-      return await generateSceneVideoWithPika({
-        scene,
-        sceneIndex,
-        totalScenes,
-        outputPath,
-      });
-    }
-
-    throw primaryErr;
-  }
+  return generateSceneVideoWithRunway({
+    scene,
+    sceneIndex,
+    totalScenes,
+    outputPath,
+  });
 }
 
 async function synthesizeSpeechOpenAIToFile({
@@ -546,23 +456,13 @@ async function synthesizeSpeechElevenLabsToFile({
 }
 
 async function synthesizeSpeechToFile({ text, voice = "alloy", outputPath }) {
-  const primary = chooseVoiceProvider();
-  const fallback = primary === "openai" ? "elevenlabs" : "openai";
-
   try {
-    if (primary === "openai") {
-      return await synthesizeSpeechOpenAIToFile({ text, voice, outputPath });
+    return await synthesizeSpeechOpenAIToFile({ text, voice, outputPath });
+  } catch (err) {
+    if (ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID) {
+      return await synthesizeSpeechElevenLabsToFile({ text, outputPath });
     }
-
-    return await synthesizeSpeechElevenLabsToFile({ text, outputPath });
-  } catch (primaryErr) {
-    console.error(`Primary voice provider ${primary} failed:`, primaryErr?.message || primaryErr);
-
-    if (fallback === "openai") {
-      return await synthesizeSpeechOpenAIToFile({ text, voice, outputPath });
-    }
-
-    return await synthesizeSpeechElevenLabsToFile({ text, outputPath });
+    throw err;
   }
 }
 
@@ -649,10 +549,8 @@ async function generateSoundEffectToFile({
   outputPath,
   durationSeconds = 3,
 }) {
-  const provider = chooseSfxProvider();
-
-  if (provider !== "elevenlabs") {
-    throw new Error("No external SFX provider configured");
+  if (!ELEVENLABS_API_KEY) {
+    throw new Error("ElevenLabs SFX requires ELEVENLABS_API_KEY");
   }
 
   const res = await fetch("https://api.elevenlabs.io/v1/sound-generation", {
@@ -673,16 +571,11 @@ async function generateSoundEffectToFile({
     throw new Error(`ElevenLabs SFX failed: ${text}`);
   }
 
-  const arrayBuffer = await res.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
+  const buffer = Buffer.from(await res.arrayBuffer());
   fs.writeFileSync(outputPath, buffer);
 }
 
-async function buildSceneDialogueTrack({
-  scene,
-  sceneIndex,
-  tmpDir,
-}) {
+async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
   const lines = Array.isArray(scene?.dialogue) ? scene.dialogue : [];
   const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
 
@@ -757,21 +650,18 @@ async function buildSceneDialogueTrack({
   return outputPath;
 }
 
-async function buildSceneSfxTrack({
-  scene,
-  sceneIndex,
-  tmpDir,
-}) {
-  const effects = Array.isArray(scene?.sound_effects) && scene.sound_effects.length
-    ? scene.sound_effects
-    : buildSimpleFallbackSoundEffects(scene);
+async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
+  const effects =
+    Array.isArray(scene?.sound_effects) && scene.sound_effects.length
+      ? scene.sound_effects
+      : buildSimpleFallbackSoundEffects(scene);
 
   const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
 
   const silentBase = path.join(tmpDir, `scene-${sceneIndex}-sfx-base.m4a`);
   await createSilentAudio(silentBase, durationSeconds);
 
-  if (!effects.length || !ENABLE_GENERATED_SFX) {
+  if (!effects.length || !ENABLE_GENERATED_SFX || !ELEVENLABS_API_KEY) {
     return silentBase;
   }
 
@@ -1436,7 +1326,6 @@ app.post("/render", async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Worker listening on ${port}`);
+app.listen(PORT, () => {
+  console.log(`Worker listening on ${PORT}`);
 });
