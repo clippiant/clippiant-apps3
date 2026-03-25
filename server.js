@@ -400,14 +400,14 @@ async function generateSceneVideoWithRunway({ scene, sceneIndex, totalScenes, ou
   const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
   const duration = Math.max(5, Math.min(10, Number(scene.duration_seconds) || 5));
 
-  const task = await runway.imageToVideo
-    .create({
-      model: RUNWAY_MODEL,
-      promptText: prompt,
-      ratio: RUNWAY_RATIO,
-      duration,
-    })
-    .waitForTaskOutput();
+  const taskRequest = runway.imageToVideo.create({
+    model: RUNWAY_MODEL,
+    promptText: prompt,
+    ratio: RUNWAY_RATIO,
+    duration,
+  });
+
+  const task = await taskRequest.waitForTaskOutput();
 
   const videoUrl =
     task?.output?.[0] ||
