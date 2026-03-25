@@ -44,7 +44,7 @@ const ENABLE_GENERATED_SFX =
 const PROVIDER_CONFIG = {
   video: {
     primary: "runway",
-    fallback: "pika",
+    fallback: "null",
   },
   voice: {
     primary: "openai",
