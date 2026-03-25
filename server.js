@@ -414,6 +414,26 @@ async function waitForRunwayTask(taskId, maxAttempts = 120, delayMs = 5000) {
   throw new Error("Runway task polling timed out");
 }
 
+async function waitForRunwayTask(taskId, maxAttempts = 120, delayMs = 5000) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const task = await runway.tasks.retrieve(taskId);
+
+    if (task?.status === "SUCCEEDED") {
+      return task;
+    }
+
+    if (task?.status === "FAILED" || task?.status === "CANCELED") {
+      throw new Error(
+        `Runway task failed with status ${task.status}: ${JSON.stringify(task)}`
+      );
+    }
+
+    await sleep(delayMs);
+  }
+
+  throw new Error("Runway task polling timed out");
+}
+
 async function generateSceneVideoWithRunway({ scene, sceneIndex, totalScenes, outputPath }) {
   if (!runway) throw new Error("Runway provider not configured");
 
