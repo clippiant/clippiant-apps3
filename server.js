@@ -44,7 +44,7 @@ const ENABLE_GENERATED_SFX =
 const PROVIDER_CONFIG = {
   video: {
     primary: "runway",
-    fallback: "null",
+    fallback: null,
   },
   voice: {
     primary: "openai",
@@ -344,11 +344,21 @@ function selectOpenAIVoiceForSpeaker(speaker) {
 }
 
 function chooseVideoProvider() {
-  if (PROVIDER_CONFIG.video.primary === "runway" && runway) return "runway";
-  if (PROVIDER_CONFIG.video.primary === "pika" && FAL_KEY) return "pika";
-  if (PROVIDER_CONFIG.video.fallback === "runway" && runway) return "runway";
-  if (PROVIDER_CONFIG.video.fallback === "pika" && FAL_KEY) return "pika";
-  throw new Error("No configured video provider is available");
+  if (PROVIDER_CONFIG.video.primary === "runway") {
+    if (!runway) {
+      throw new Error("Runway is configured as primary but is not available");
+    }
+    return "runway";
+  }
+
+  if (PROVIDER_CONFIG.video.primary === "pika") {
+    if (!FAL_KEY) {
+      throw new Error("Pika is configured as primary but is not available");
+    }
+    return "pika";
+  }
+
+  throw new Error("No valid primary video provider configured");
 }
 
 function chooseVoiceProvider() {
@@ -440,8 +450,7 @@ async function generateSceneVideoWithPika({ scene, sceneIndex, totalScenes, outp
 
 async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }) {
   const primary = chooseVideoProvider();
-  const fallback =
-    primary === "runway" ? "pika" : "runway";
+  const fallback = PROVIDER_CONFIG.video.fallback;
 
   try {
     if (primary === "runway") {
@@ -453,14 +462,22 @@ async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }
       });
     }
 
-    return await generateSceneVideoWithPika({
-      scene,
-      sceneIndex,
-      totalScenes,
-      outputPath,
-    });
+    if (primary === "pika") {
+      return await generateSceneVideoWithPika({
+        scene,
+        sceneIndex,
+        totalScenes,
+        outputPath,
+      });
+    }
+
+    throw new Error(`Unknown primary video provider: ${primary}`);
   } catch (primaryErr) {
     console.error(`Primary video provider ${primary} failed:`, primaryErr?.message || primaryErr);
+
+    if (!fallback) {
+      throw primaryErr;
+    }
 
     if (fallback === "runway" && runway) {
       return await generateSceneVideoWithRunway({
