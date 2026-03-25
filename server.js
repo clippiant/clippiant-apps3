@@ -25,13 +25,13 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 const DEFAULT_SCENE_SECONDS = Number(process.env.DEFAULT_SCENE_SECONDS || "4");
 const MAX_SCENES_PER_EXPORT = Number(process.env.MAX_SCENES_PER_EXPORT || "4");
 
-const RUNWAY_MODEL = process.env.RUNWAY_MODEL || "veo3.1";
-const RUNWAY_RATIO = process.env.RUNWAY_RATIO || "1280:720";
+const RUNWAY_MODEL = process.env.RUNWAY_MODEL || "gen4.5";
+const RUNWAY_RATIO = process.env.RUNWAY_RATIO || "1920:1080";
 
 const PIKA_ENDPOINT =
   process.env.PIKA_ENDPOINT || "fal-ai/pika/v2.1/text-to-video";
 const PIKA_ASPECT_RATIO = process.env.PIKA_ASPECT_RATIO || "16:9";
-const PIKA_RESOLUTION = process.env.PIKA_RESOLUTION || "720p";
+const PIKA_RESOLUTION = process.env.PIKA_RESOLUTION || "1080p";
 
 const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
@@ -398,9 +398,9 @@ async function generateSceneVideoWithRunway({ scene, sceneIndex, totalScenes, ou
   if (!runway) throw new Error("Runway provider not configured");
 
   const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
-  const duration = Math.max(2, Math.min(10, normalizeVideoSeconds(scene.duration_seconds)));
+  const duration = Math.max(5, Math.min(10, Number(scene.duration_seconds) || 5));
 
-  const task = await runway.textToVideo
+  const task = await runway.imageToVideo
     .create({
       model: RUNWAY_MODEL,
       promptText: prompt,
@@ -409,7 +409,14 @@ async function generateSceneVideoWithRunway({ scene, sceneIndex, totalScenes, ou
     })
     .waitForTaskOutput();
 
-  const videoUrl = extractRunwayVideoUrl(task);
+  const videoUrl =
+    task?.output?.[0] ||
+    task?.output?.video ||
+    task?.output?.video_url ||
+    task?.video_url ||
+    task?.url ||
+    null;
+
   if (!videoUrl) {
     throw new Error("Runway completed without a usable output URL");
   }
