@@ -414,61 +414,6 @@ async function waitForRunwayTask(taskId, maxAttempts = 120, delayMs = 5000) {
   throw new Error("Runway task polling timed out");
 }
 
-async function waitForRunwayTask(taskId, maxAttempts = 120, delayMs = 5000) {
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const task = await runway.tasks.retrieve(taskId);
-
-    if (task?.status === "SUCCEEDED") {
-      return task;
-    }
-
-    if (task?.status === "FAILED" || task?.status === "CANCELED") {
-      throw new Error(
-        `Runway task failed with status ${task.status}: ${JSON.stringify(task)}`
-      );
-    }
-
-    await sleep(delayMs);
-  }
-
-  throw new Error("Runway task polling timed out");
-}
-
-async function generateSceneVideoWithRunway({ scene, sceneIndex, totalScenes, outputPath }) {
-  if (!runway) throw new Error("Runway provider not configured");
-
-  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
-  const duration = Math.max(5, Math.min(10, Number(scene.duration_seconds) || 5));
-
-  const taskStart = await runway.imageToVideo.create({
-    model: RUNWAY_MODEL,
-    promptText: prompt,
-    ratio: RUNWAY_RATIO,
-    duration,
-  });
-
-  if (!taskStart?.id) {
-    throw new Error(`Runway did not return a task id: ${JSON.stringify(taskStart)}`);
-  }
-
-  const task = await waitForRunwayTask(taskStart.id);
-
-  const videoUrl =
-    task?.output?.[0] ||
-    task?.output?.video ||
-    task?.output?.video_url ||
-    task?.video_url ||
-    task?.url ||
-    null;
-
-  if (!videoUrl) {
-    throw new Error(`Runway completed without a usable output URL: ${JSON.stringify(task)}`);
-  }
-
-  await downloadToFile(videoUrl, outputPath);
-  return outputPath;
-}
-
 async function generateSceneVideoWithPika({ scene, sceneIndex, totalScenes, outputPath }) {
   if (!FAL_KEY) throw new Error("Pika/Fal provider not configured");
 
