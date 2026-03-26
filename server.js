@@ -451,19 +451,6 @@ async function generateSceneVideoWithPika({
 }
 
 async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }) {
-  try {
-    return await generateSceneVideoWithRunway({
-      scene,
-      sceneIndex,
-      totalScenes,
-      outputPath,
-    });
-  } catch (runwayErr) {
-    console.error("Runway failed, trying Pika fallback:", runwayErr?.message || runwayErr);
-
-    if (!process.env.FAL_KEY || PROVIDER_CONFIG.video.fallback !== "pika") {
-      throw runwayErr;
-    }
 
     return await generateSceneVideoWithPika({
       scene,
@@ -472,7 +459,6 @@ async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }
       outputPath,
     });
   }
-}
 
 async function synthesizeSpeechOpenAIToFile({
   text,
