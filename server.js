@@ -6,6 +6,7 @@ import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import RunwayML from "@runwayml/sdk";
+import { fal } from "@fal-ai/client";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -28,6 +29,11 @@ const MAX_SCENES_PER_EXPORT = Number(process.env.MAX_SCENES_PER_EXPORT || "8");
 const RUNWAY_MODEL = process.env.RUNWAY_MODEL || "gen4.5";
 const RUNWAY_RATIO = process.env.RUNWAY_RATIO || "1280:720";
 
+const PIKA_ENDPOINT =
+  process.env.PIKA_ENDPOINT || "fal-ai/pika/v2.2/text-to-video";
+const PIKA_ASPECT_RATIO = process.env.PIKA_ASPECT_RATIO || "16:9";
+const PIKA_RESOLUTION = process.env.PIKA_RESOLUTION || "720p";
+
 const ENABLE_SUBTITLES =
   String(process.env.ENABLE_SUBTITLES || "false") === "true";
 
@@ -37,6 +43,21 @@ const ENABLE_GENERATED_SFX =
 const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
 const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
+
+const PROVIDER_CONFIG = {
+  video: {
+    primary: "runway",
+    fallback: "pika",
+  },
+  voice: {
+    primary: "openai",
+    fallback: "elevenlabs",
+  },
+  sfx: {
+    primary: "elevenlabs",
+    fallback: "internal",
+  },
+};
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -57,6 +78,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const runway = new RunwayML({ apiKey: RUNWAYML_API_SECRET });
 
+if (process.env.FAL_KEY) {
+  fal.config({ credentials: process.env.FAL_KEY });
+}
+
 console.log("RUNWAY ENV CHECK:", {
   hasRunwaySecret: Boolean(process.env.RUNWAYML_API_SECRET),
   runwaySecretPrefix: process.env.RUNWAYML_API_SECRET
@@ -64,6 +89,10 @@ console.log("RUNWAY ENV CHECK:", {
     : null,
 });
 console.log("RUNWAY CLIENT AVAILABLE:", Boolean(runway));
+console.log("PIKA ENV CHECK:", {
+  hasFalKey: Boolean(process.env.FAL_KEY),
+  endpoint: PIKA_ENDPOINT,
+});
 
 function requireSecret(req, res) {
   if (!WORKER_SECRET) {
@@ -175,13 +204,19 @@ function toPositiveInt(value, fallback) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
-function normalizeVideoSeconds(value) {
+function clampRunwaySeconds(value) {
   const n = Number(value);
   if (n >= 10) return 10;
   if (n >= 8) return 8;
   if (n >= 6) return 6;
   if (n >= 4) return 4;
   return 4;
+}
+
+function clampPikaSeconds(value) {
+  const n = Number(value);
+  if (n >= 10) return 10;
+  return 5;
 }
 
 function stableHash(str) {
@@ -208,7 +243,7 @@ function normalizeScenes(project) {
         title: project?.title || "Scene 1",
         narration: project?.script || project?.title || "",
         base_prompt:
-          "A cinematic realistic video scene with strong visual continuity, consistent subject identity, consistent environment, consistent lighting, and realistic motion.",
+          "A cinematic realistic video scene with strong visual continuity, stable subject identity, natural motion, and consistent lighting.",
         continuity_rules:
           "Continue naturally from the previous scene. Keep the same subjects, environment, lighting, style, and motion continuity unless explicitly changed.",
         duration_seconds: DEFAULT_SCENE_SECONDS,
@@ -242,17 +277,35 @@ function normalizeScenes(project) {
 }
 
 function buildSceneVideoPrompt(scene, sceneIndex, totalScenes) {
-  const parts = [
+  const dialogueSummary = Array.isArray(scene?.dialogue)
+    ? scene.dialogue
+        .filter((line) => typeof line?.text === "string" && line.text.trim())
+        .map((line) => `${line.speaker || "Speaker"} says: ${line.text}`)
+        .join(" ")
+    : "";
+
+  const sfxSummary = Array.isArray(scene?.sound_effects)
+    ? scene.sound_effects
+        .filter((fx) => typeof fx?.prompt === "string" && fx.prompt.trim())
+        .map((fx) => fx.prompt)
+        .join("; ")
+    : "";
+
+  const prompt = [
     `Scene ${sceneIndex + 1} of ${totalScenes}.`,
     scene?.base_prompt || "",
     scene?.continuity_rules || "",
     scene?.narration ? `Context: ${scene.narration}` : "",
-    "Cinematic, realistic motion, stable subjects, stable lighting, no subtitles or on-screen text."
+    dialogueSummary ? `Dialogue: ${dialogueSummary}` : "",
+    sfxSummary ? `Action audio cues: ${sfxSummary}` : "",
+    "Cinematic, realistic motion, stable subjects, stable environment, stable lighting, no subtitles or on-screen text."
   ]
     .filter(Boolean)
-    .join(" ");
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  return parts.slice(0, 1000);
+  return prompt;
 }
 
 function getNarrationText(project, scenes) {
@@ -314,6 +367,17 @@ async function waitForRunwayTask(taskId, maxAttempts = 120, delayMs = 5000) {
   throw new Error("Runway task polling timed out");
 }
 
+function extractRunwayVideoUrl(task) {
+  return (
+    task?.output?.[0] ||
+    task?.output?.video ||
+    task?.output?.video_url ||
+    task?.video_url ||
+    task?.url ||
+    null
+  );
+}
+
 async function generateSceneVideoWithRunway({
   scene,
   sceneIndex,
@@ -325,12 +389,12 @@ async function generateSceneVideoWithRunway({
   }
 
   const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes).slice(0, 1000);
-  const duration = Math.max(4, Math.min(10, normalizeVideoSeconds(scene.duration_seconds)));
+  const duration = clampRunwaySeconds(scene.duration_seconds);
 
   const taskStart = await runway.textToVideo.create({
     model: RUNWAY_MODEL,
     promptText: prompt,
-    ratio: "1280:720",
+    ratio: RUNWAY_RATIO,
     duration,
   });
 
@@ -339,14 +403,7 @@ async function generateSceneVideoWithRunway({
   }
 
   const task = await waitForRunwayTask(taskStart.id);
-
-  const videoUrl =
-    task?.output?.[0] ||
-    task?.output?.video ||
-    task?.output?.video_url ||
-    task?.video_url ||
-    task?.url ||
-    null;
+  const videoUrl = extractRunwayVideoUrl(task);
 
   if (!videoUrl) {
     throw new Error(`Runway completed without a usable output URL: ${JSON.stringify(task)}`);
@@ -356,13 +413,65 @@ async function generateSceneVideoWithRunway({
   return outputPath;
 }
 
-async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }) {
-  return generateSceneVideoWithRunway({
-    scene,
-    sceneIndex,
-    totalScenes,
-    outputPath,
+async function generateSceneVideoWithPika({
+  scene,
+  sceneIndex,
+  totalScenes,
+  outputPath,
+}) {
+  if (!process.env.FAL_KEY) {
+    throw new Error("Pika/Fal provider not configured");
+  }
+
+  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes).slice(0, 1200);
+  const duration = clampPikaSeconds(scene.duration_seconds);
+
+  const result = await fal.subscribe(PIKA_ENDPOINT, {
+    input: {
+      prompt,
+      aspect_ratio: PIKA_ASPECT_RATIO,
+      resolution: PIKA_RESOLUTION,
+      duration,
+    },
+    logs: true,
   });
+
+  const videoUrl =
+    result?.data?.video?.url ||
+    result?.data?.videos?.[0]?.url ||
+    result?.video?.url ||
+    null;
+
+  if (!videoUrl) {
+    throw new Error(`Pika completed without a usable output URL: ${JSON.stringify(result)}`);
+  }
+
+  await downloadToFile(videoUrl, outputPath);
+  return outputPath;
+}
+
+async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }) {
+  try {
+    return await generateSceneVideoWithRunway({
+      scene,
+      sceneIndex,
+      totalScenes,
+      outputPath,
+    });
+  } catch (runwayErr) {
+    console.error("Runway failed, trying Pika fallback:", runwayErr?.message || runwayErr);
+
+    if (!process.env.FAL_KEY || PROVIDER_CONFIG.video.fallback !== "pika") {
+      throw runwayErr;
+    }
+
+    return await generateSceneVideoWithPika({
+      scene,
+      sceneIndex,
+      totalScenes,
+      outputPath,
+    });
+  }
 }
 
 async function synthesizeSpeechOpenAIToFile({
