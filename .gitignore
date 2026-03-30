@@ -21,3 +21,6 @@ tmp/
 *.mp3
 *.m4a
 *.wav
+
+# allow background music file to be included in repo
+!assets/background-music.mp3
