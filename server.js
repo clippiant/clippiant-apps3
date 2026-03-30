@@ -234,49 +234,127 @@ function selectOpenAIVoiceForSpeaker(speaker) {
   return voices[index];
 }
 
+function normalizeStringList(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+}
+
+function normalizeText(value, fallback = "") {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function inheritSceneFields(scene, previousScene) {
+  const currentCharacters = normalizeStringList(scene?.characters);
+  const currentProps = normalizeStringList(scene?.props);
+  const previousCharacters = normalizeStringList(previousScene?.characters);
+  const previousProps = normalizeStringList(previousScene?.props);
+
+  return {
+    ...scene,
+    characters: currentCharacters.length ? currentCharacters : previousCharacters,
+    props: currentProps.length ? currentProps : previousProps,
+    background: normalizeText(
+      scene?.background,
+      normalizeText(previousScene?.background, "")
+    ),
+    video_style: normalizeText(
+      scene?.video_style,
+      normalizeText(
+        previousScene?.video_style,
+        "cinematic realism, natural motion, stable subject identity, consistent wardrobe, consistent props, consistent environment, consistent lighting"
+      )
+    ),
+  };
+}
+
+function summarizeList(label, items) {
+  const arr = normalizeStringList(items);
+  return arr.length ? `${label}: ${arr.join(", ")}.` : "";
+}
+
+function buildStrictContinuityBlock(scene, previousScene) {
+  const parts = [
+    summarizeList("Locked characters", scene?.characters),
+    summarizeList("Locked props", scene?.props),
+    scene?.background ? `Locked background/environment: ${scene.background}.` : "",
+    scene?.video_style ? `Locked visual style: ${scene.video_style}.` : "",
+    previousScene?.title
+      ? `Previous scene reference: continue from "${previousScene.title}" without redesigning the characters, props, environment, wardrobe, color palette, framing, or camera language unless explicitly changed.`
+      : "",
+    "Continuity rules: keep the same character identity, face, hairstyle, body type, apparent age, skin tone, wardrobe, major props, environment, color palette, lighting direction, lens feel, and overall art direction. Do not introduce a new main subject. Do not change ethnicity, hairstyle, outfit, key props, or setting unless the prompt explicitly says so.",
+  ];
+
+  return parts.filter(Boolean).join(" ");
+}
+
 function normalizeScenes(project) {
   const rawScenes = Array.isArray(project?.scenes) ? project.scenes : [];
 
-  if (!rawScenes.length) {
-    return [
-      {
-        title: project?.title || "Scene 1",
-        narration: project?.script || project?.title || "",
+  const baseScenes = !rawScenes.length
+    ? [
+        {
+          title: project?.title || "Scene 1",
+          narration: project?.script || project?.title || "",
+          base_prompt:
+            "A cinematic realistic video scene with strong visual continuity, stable subject identity, natural motion, and consistent lighting.",
+          continuity_rules:
+            "Continue naturally from the previous scene. Keep the same subjects, environment, lighting, style, and motion continuity unless explicitly changed.",
+          duration_seconds: DEFAULT_SCENE_SECONDS,
+          dialogue: [],
+          sound_effects: [],
+          characters: [],
+          props: [],
+          background: "",
+          video_style:
+            "cinematic realism, natural motion, stable subject identity, consistent wardrobe, consistent props, consistent environment, consistent lighting",
+        },
+      ]
+    : rawScenes.map((scene, sceneIndex) => ({
+        title: scene?.title || `Scene ${sceneIndex + 1}`,
+        narration:
+          typeof scene?.narration === "string"
+            ? scene.narration
+            : typeof scene?.voiceover === "string"
+            ? scene.voiceover
+            : typeof scene?.text === "string"
+            ? scene.text
+            : "",
         base_prompt:
-          "A cinematic realistic video scene with strong visual continuity, stable subject identity, natural motion, and consistent lighting.",
+          scene?.base_prompt ||
+          scene?.visual ||
+          `A cinematic realistic video scene for ${scene?.title || `scene ${sceneIndex + 1}`}.`,
         continuity_rules:
+          scene?.continuity_rules ||
           "Continue naturally from the previous scene. Keep the same subjects, environment, lighting, style, and motion continuity unless explicitly changed.",
-        duration_seconds: DEFAULT_SCENE_SECONDS,
-        dialogue: [],
-        sound_effects: [],
-      },
-    ];
+        duration_seconds: toPositiveInt(
+          scene?.duration_seconds,
+          DEFAULT_SCENE_SECONDS
+        ),
+        dialogue: Array.isArray(scene?.dialogue) ? scene.dialogue : [],
+        sound_effects: Array.isArray(scene?.sound_effects)
+          ? scene.sound_effects
+          : [],
+        characters: normalizeStringList(scene?.characters),
+        props: normalizeStringList(scene?.props),
+        background: normalizeText(scene?.background, ""),
+        video_style: normalizeText(
+          scene?.video_style,
+          "cinematic realism, natural motion, stable subject identity, consistent wardrobe, consistent props, consistent environment, consistent lighting"
+        ),
+      }));
+
+  const normalizedScenes = [];
+  for (let i = 0; i < baseScenes.length; i++) {
+    const previousScene = i > 0 ? normalizedScenes[i - 1] : null;
+    normalizedScenes.push(inheritSceneFields(baseScenes[i], previousScene));
   }
 
-  return rawScenes.map((scene, sceneIndex) => ({
-    title: scene?.title || `Scene ${sceneIndex + 1}`,
-    narration:
-      typeof scene?.narration === "string"
-        ? scene.narration
-        : typeof scene?.voiceover === "string"
-        ? scene.voiceover
-        : typeof scene?.text === "string"
-        ? scene.text
-        : "",
-    base_prompt:
-      scene?.base_prompt ||
-      scene?.visual ||
-      `A cinematic realistic video scene for ${scene?.title || `scene ${sceneIndex + 1}`}.`,
-    continuity_rules:
-      scene?.continuity_rules ||
-      "Continue naturally from the previous scene. Keep the same subjects, environment, lighting, style, and motion continuity unless explicitly changed.",
-    duration_seconds: toPositiveInt(scene?.duration_seconds, DEFAULT_SCENE_SECONDS),
-    dialogue: Array.isArray(scene?.dialogue) ? scene.dialogue : [],
-    sound_effects: Array.isArray(scene?.sound_effects) ? scene.sound_effects : [],
-  }));
+  return normalizedScenes;
 }
 
-function buildSceneVideoPrompt(scene, sceneIndex, totalScenes) {
+function buildSceneVideoPrompt(scene, sceneIndex, totalScenes, previousScene = null) {
   const dialogueSummary = Array.isArray(scene?.dialogue)
     ? scene.dialogue
         .filter((line) => typeof line?.text === "string" && line.text.trim())
@@ -291,14 +369,17 @@ function buildSceneVideoPrompt(scene, sceneIndex, totalScenes) {
         .join("; ")
     : "";
 
+  const strictContinuity = buildStrictContinuityBlock(scene, previousScene);
+
   const prompt = [
     `Scene ${sceneIndex + 1} of ${totalScenes}.`,
+    strictContinuity,
     scene?.base_prompt || "",
     scene?.continuity_rules || "",
-    scene?.narration ? `Context: ${scene.narration}` : "",
-    dialogueSummary ? `Dialogue: ${dialogueSummary}` : "",
-    sfxSummary ? `Action audio cues: ${sfxSummary}` : "",
-    "Cinematic, realistic motion, stable subjects, stable environment, stable lighting, no subtitles or on-screen text."
+    scene?.narration ? `Scene context: ${scene.narration}` : "",
+    dialogueSummary ? `Dialogue context: ${dialogueSummary}` : "",
+    sfxSummary ? `Action/audio cues: ${sfxSummary}` : "",
+    "Output a single coherent cinematic video shot with stable subject identity, stable wardrobe, stable props, stable environment, stable lighting, natural motion, and no subtitles or on-screen text.",
   ]
     .filter(Boolean)
     .join(" ")
@@ -380,6 +461,7 @@ function extractRunwayVideoUrl(task) {
 
 async function generateSceneVideoWithRunway({
   scene,
+  previousScene,
   sceneIndex,
   totalScenes,
   outputPath,
@@ -388,7 +470,13 @@ async function generateSceneVideoWithRunway({
     throw new Error("Runway provider not configured");
   }
 
-  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes).slice(0, 1000);
+  const prompt = buildSceneVideoPrompt(
+    scene,
+    sceneIndex,
+    totalScenes,
+    previousScene
+  ).slice(0, 1000);
+
   const duration = clampRunwaySeconds(scene.duration_seconds);
 
   const taskStart = await runway.textToVideo.create({
@@ -415,6 +503,7 @@ async function generateSceneVideoWithRunway({
 
 async function generateSceneVideoWithPika({
   scene,
+  previousScene,
   sceneIndex,
   totalScenes,
   outputPath,
@@ -423,7 +512,13 @@ async function generateSceneVideoWithPika({
     throw new Error("Pika/Fal provider not configured");
   }
 
-  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes).slice(0, 1200);
+  const prompt = buildSceneVideoPrompt(
+    scene,
+    sceneIndex,
+    totalScenes,
+    previousScene
+  ).slice(0, 1200);
+
   const duration = clampPikaSeconds(scene.duration_seconds);
 
   const result = await fal.subscribe(PIKA_ENDPOINT, {
@@ -450,15 +545,37 @@ async function generateSceneVideoWithPika({
   return outputPath;
 }
 
-async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }) {
+async function generateSceneVideo({
+  scene,
+  previousScene,
+  sceneIndex,
+  totalScenes,
+  outputPath,
+}) {
+  try {
+    return await generateSceneVideoWithRunway({
+      scene,
+      previousScene,
+      sceneIndex,
+      totalScenes,
+      outputPath,
+    });
+  } catch (runwayErr) {
+    console.error("Runway failed, trying Pika fallback:", runwayErr?.message || runwayErr);
+
+    if (!process.env.FAL_KEY || PROVIDER_CONFIG.video.fallback !== "pika") {
+      throw runwayErr;
+    }
 
     return await generateSceneVideoWithPika({
       scene,
+      previousScene,
       sceneIndex,
       totalScenes,
       outputPath,
     });
   }
+}
 
 async function synthesizeSpeechOpenAIToFile({
   text,
@@ -1255,6 +1372,8 @@ app.post("/render", async (req, res) => {
 
     for (let sceneIndex = 0; sceneIndex < scenes.length; sceneIndex++) {
       const scene = scenes[sceneIndex];
+      const previousScene = sceneIndex > 0 ? scenes[sceneIndex - 1] : null;
+
       const sceneClipPath = path.join(
         tmpDir,
         `scene-clip-${String(sceneIndex + 1).padStart(2, "0")}.mp4`
@@ -1262,6 +1381,7 @@ app.post("/render", async (req, res) => {
 
       await generateSceneVideo({
         scene,
+        previousScene,
         sceneIndex,
         totalScenes: scenes.length,
         outputPath: sceneClipPath,
