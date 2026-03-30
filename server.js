@@ -40,7 +40,9 @@ const ENABLE_SUBTITLES =
 const ENABLE_GENERATED_SFX =
   String(process.env.ENABLE_GENERATED_SFX || "true") === "true";
 
-const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
+const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH
+  ? path.resolve(process.cwd(), process.env.BACKGROUND_MUSIC_PATH)
+  : "";
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
 const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
 
@@ -92,6 +94,12 @@ console.log("RUNWAY CLIENT AVAILABLE:", Boolean(runway));
 console.log("PIKA ENV CHECK:", {
   hasFalKey: Boolean(process.env.FAL_KEY),
   endpoint: PIKA_ENDPOINT,
+});
+
+console.log("BGM ENV CHECK:", {
+  configuredPath: process.env.BACKGROUND_MUSIC_PATH || null,
+  resolvedPath: BACKGROUND_MUSIC_PATH || null,
+  exists: BACKGROUND_MUSIC_PATH ? fs.existsSync(BACKGROUND_MUSIC_PATH) : false,
 });
 
 function requireSecret(req, res) {
@@ -723,6 +731,11 @@ async function generateSoundEffectToFile({
     throw new Error("ElevenLabs SFX requires ELEVENLABS_API_KEY");
   }
 
+  console.log("Calling ElevenLabs SFX:", {
+    prompt,
+    durationSeconds,
+  });
+
   const res = await fetch("https://api.elevenlabs.io/v1/sound-generation", {
     method: "POST",
     headers: {
@@ -738,11 +751,21 @@ async function generateSoundEffectToFile({
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`ElevenLabs SFX failed: ${text}`);
+    throw new Error(`ElevenLabs SFX failed (${res.status}): ${text}`);
   }
 
   const buffer = Buffer.from(await res.arrayBuffer());
+
+  if (!buffer.length) {
+    throw new Error("ElevenLabs SFX returned empty audio");
+  }
+
   fs.writeFileSync(outputPath, buffer);
+
+  console.log("Saved ElevenLabs SFX:", {
+    outputPath,
+    bytes: buffer.length,
+  });
 }
 
 async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
@@ -831,7 +854,25 @@ async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
   const silentBase = path.join(tmpDir, `scene-${sceneIndex}-sfx-base.m4a`);
   await createSilentAudio(silentBase, durationSeconds);
 
-  if (!effects.length || !ENABLE_GENERATED_SFX || !ELEVENLABS_API_KEY) {
+  console.log(`SFX scene ${sceneIndex + 1}:`, {
+    enableGeneratedSfx: ENABLE_GENERATED_SFX,
+    hasElevenLabsKey: Boolean(ELEVENLABS_API_KEY),
+    requestedEffects: effects.length,
+    effects,
+  });
+
+  if (!effects.length) {
+    console.log(`SFX scene ${sceneIndex + 1}: no effects requested, using silence`);
+    return silentBase;
+  }
+
+  if (!ENABLE_GENERATED_SFX) {
+    console.log(`SFX scene ${sceneIndex + 1}: ENABLE_GENERATED_SFX is false, using silence`);
+    return silentBase;
+  }
+
+  if (!ELEVENLABS_API_KEY) {
+    console.log(`SFX scene ${sceneIndex + 1}: missing ELEVENLABS_API_KEY, using silence`);
     return silentBase;
   }
 
@@ -847,6 +888,8 @@ async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
     );
 
     try {
+      console.log(`Generating SFX for scene ${sceneIndex + 1}, effect ${i + 1}:`, fx.prompt);
+
       await generateSoundEffectToFile({
         prompt: fx.prompt,
         outputPath: generatedPath,
@@ -856,16 +899,28 @@ async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
         ),
       });
 
-      usableEffects.push({
-        ...fx,
-        resolvedPath: generatedPath,
+      const exists = fs.existsSync(generatedPath);
+      console.log(`SFX generated for scene ${sceneIndex + 1}, effect ${i + 1}:`, {
+        path: generatedPath,
+        exists,
       });
+
+      if (exists) {
+        usableEffects.push({
+          ...fx,
+          resolvedPath: generatedPath,
+        });
+      }
     } catch (err) {
-      console.error(`Skipping failed SFX ${i}:`, err?.message || err);
+      console.error(
+        `Failed SFX for scene ${sceneIndex + 1}, effect ${i + 1}:`,
+        err?.message || err
+      );
     }
   }
 
   if (!usableEffects.length) {
+    console.log(`SFX scene ${sceneIndex + 1}: all SFX failed, using silence`);
     return silentBase;
   }
 
@@ -906,6 +961,8 @@ async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
     "aac",
     outputPath,
   ]);
+
+  console.log(`SFX scene ${sceneIndex + 1}: mixed ${usableEffects.length} effect(s)`);
 
   return outputPath;
 }
@@ -1167,9 +1224,18 @@ async function mergeVideoWithFinalAudio({
   bgmVolume,
 }) {
   const hasMusic =
-    backgroundMusicPath &&
+    Boolean(backgroundMusicPath) &&
     fs.existsSync(backgroundMusicPath) &&
     fs.statSync(backgroundMusicPath).isFile();
+
+  console.log("mergeVideoWithFinalAudio:", {
+    videoPath,
+    finalAudioPath,
+    outputPath,
+    backgroundMusicPath,
+    hasMusic,
+    bgmVolume,
+  });
 
   const videoHasAudio = await checkIfVideoHasAudio(videoPath);
 
