@@ -40,24 +40,20 @@ const ENABLE_SUBTITLES =
 const ENABLE_GENERATED_SFX =
   String(process.env.ENABLE_GENERATED_SFX || "true") === "true";
 
+const ENABLE_AUTO_SFX_INFERENCE =
+  String(process.env.ENABLE_AUTO_SFX_INFERENCE || "false") === "true";
+
 const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH
   ? path.resolve(process.cwd(), process.env.BACKGROUND_MUSIC_PATH)
   : "";
-const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
+
+const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.03");
 const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
 
 const PROVIDER_CONFIG = {
   video: {
     primary: "runway",
     fallback: "pika",
-  },
-  voice: {
-    primary: "openai",
-    fallback: "elevenlabs",
-  },
-  sfx: {
-    primary: "elevenlabs",
-    fallback: "internal",
   },
 };
 
@@ -71,14 +67,17 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-if (!RUNWAYML_API_SECRET) {
-  console.error("Missing RUNWAYML_API_SECRET");
+if (!RUNWAYML_API_SECRET && !process.env.FAL_KEY) {
+  console.error("Missing both RUNWAYML_API_SECRET and FAL_KEY");
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-const runway = new RunwayML({ apiKey: RUNWAYML_API_SECRET });
+
+const runway = RUNWAYML_API_SECRET
+  ? new RunwayML({ apiKey: RUNWAYML_API_SECRET })
+  : null;
 
 if (process.env.FAL_KEY) {
   fal.config({ credentials: process.env.FAL_KEY });
@@ -95,12 +94,18 @@ console.log("PIKA ENV CHECK:", {
   hasFalKey: Boolean(process.env.FAL_KEY),
   endpoint: PIKA_ENDPOINT,
 });
-
 console.log("BGM ENV CHECK:", {
   configuredPath: process.env.BACKGROUND_MUSIC_PATH || null,
   resolvedPath: BACKGROUND_MUSIC_PATH || null,
   exists: BACKGROUND_MUSIC_PATH ? fs.existsSync(BACKGROUND_MUSIC_PATH) : false,
 });
+console.log("APP ROOT CONTENTS:", fs.readdirSync(process.cwd()));
+console.log(
+  "ASSETS CONTENTS:",
+  fs.existsSync(path.join(process.cwd(), "assets"))
+    ? fs.readdirSync(path.join(process.cwd(), "assets"))
+    : "assets folder missing"
+);
 
 function requireSecret(req, res) {
   if (!WORKER_SECRET) {
@@ -600,10 +605,7 @@ async function synthesizeSpeechOpenAIToFile({
   fs.writeFileSync(outputPath, buffer);
 }
 
-async function synthesizeSpeechElevenLabsToFile({
-  text,
-  outputPath,
-}) {
+async function synthesizeSpeechElevenLabsToFile({ text, outputPath }) {
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     throw new Error("ElevenLabs TTS requires ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID");
   }
@@ -659,67 +661,104 @@ async function createSilentAudio(outputPath, durationSeconds) {
   ]);
 }
 
-function buildSimpleFallbackSoundEffects(scene) {
+function inferConservativeAutoSfx(scene) {
   const sceneText = [
     scene?.title || "",
     scene?.base_prompt || "",
     scene?.narration || "",
+    ...(Array.isArray(scene?.dialogue)
+      ? scene.dialogue.map((line) => line?.text || "")
+      : []),
   ]
     .join(" ")
     .toLowerCase();
 
+  const duration = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
   const effects = [];
 
-  if (
-    sceneText.includes("kitchen") ||
-    sceneText.includes("cook") ||
-    sceneText.includes("oven") ||
-    sceneText.includes("cookie")
-  ) {
+  if (sceneText.includes("keyboard") || sceneText.includes("typing")) {
     effects.push({
-      prompt: "soft kitchen ambience, distant oven hum, subtle ceramic clink",
-      start_seconds: 0,
-      duration_seconds: 3,
+      prompt: "soft keyboard typing, gentle office keys",
+      start_seconds: Math.min(0.5, duration * 0.2),
+      duration_seconds: Math.min(3, duration),
+      volume: 0.7,
+    });
+  }
+
+  if (sceneText.includes("coffee") || sceneText.includes("cup") || sceneText.includes("mug")) {
+    effects.push({
+      prompt: "ceramic mug set down softly on wooden desk",
+      start_seconds: Math.min(2.0, Math.max(0.3, duration * 0.6)),
+      duration_seconds: 1,
       volume: 0.8,
     });
   }
 
+  if (sceneText.includes("door")) {
+    effects.push({
+      prompt: "door closes gently indoors",
+      start_seconds: Math.min(1.5, Math.max(0.2, duration * 0.4)),
+      duration_seconds: 1,
+      volume: 0.85,
+    });
+  }
+
+  if (sceneText.includes("walk") || sceneText.includes("footstep")) {
+    effects.push({
+      prompt: "light footsteps matching a calm walk",
+      start_seconds: Math.min(0.6, duration * 0.2),
+      duration_seconds: Math.min(3, duration),
+      volume: 0.75,
+    });
+  }
+
   if (
-    sceneText.includes("city") ||
     sceneText.includes("street") ||
+    sceneText.includes("city") ||
     sceneText.includes("traffic")
   ) {
     effects.push({
-      prompt: "soft city ambience, distant traffic, light urban atmosphere",
+      prompt: "soft distant city ambience, subtle traffic",
       start_seconds: 0,
-      duration_seconds: 3,
-      volume: 0.8,
+      duration_seconds: Math.min(4, duration),
+      volume: 0.45,
     });
   }
 
   if (
     sceneText.includes("forest") ||
     sceneText.includes("woods") ||
-    sceneText.includes("nature")
+    sceneText.includes("nature") ||
+    sceneText.includes("park")
   ) {
     effects.push({
-      prompt: "gentle forest ambience, birds, subtle wind through leaves",
+      prompt: "gentle outdoor ambience, birds and soft wind in leaves",
       start_seconds: 0,
-      duration_seconds: 3,
-      volume: 0.8,
+      duration_seconds: Math.min(4, duration),
+      volume: 0.4,
     });
   }
 
-  if (!effects.length) {
-    effects.push({
-      prompt: "subtle cinematic ambient room tone with light movement",
-      start_seconds: 0,
-      duration_seconds: 3,
-      volume: 0.8,
-    });
+  return effects.slice(0, 2);
+}
+
+function resolveSceneSoundEffects(scene) {
+  const manualEffects =
+    Array.isArray(scene?.sound_effects) && scene.sound_effects.length
+      ? scene.sound_effects.filter(
+          (fx) => typeof fx?.prompt === "string" && fx.prompt.trim()
+        )
+      : [];
+
+  if (manualEffects.length) {
+    return manualEffects;
   }
 
-  return effects;
+  if (ENABLE_AUTO_SFX_INFERENCE) {
+    return inferConservativeAutoSfx(scene);
+  }
+
+  return [];
 }
 
 async function generateSoundEffectToFile({
@@ -775,17 +814,24 @@ async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
   const silentBase = path.join(tmpDir, `scene-${sceneIndex}-dialogue-base.m4a`);
   await createSilentAudio(silentBase, durationSeconds);
 
-  if (!lines.length) return silentBase;
+  if (!lines.length) {
+    console.log(`Dialogue scene ${sceneIndex + 1}: no dialogue lines`);
+    return silentBase;
+  }
 
   const usableLines = lines.filter(
     (line) => typeof line?.text === "string" && line.text.trim()
   );
 
-  if (!usableLines.length) return silentBase;
+  if (!usableLines.length) {
+    console.log(`Dialogue scene ${sceneIndex + 1}: no usable dialogue lines`);
+    return silentBase;
+  }
 
   const inputArgs = ["-i", silentBase];
   const filterParts = ["[0:a]volume=1.0[a0]"];
   const mixInputs = ["[a0]"];
+  let addedCount = 0;
 
   for (let i = 0; i < usableLines.length; i++) {
     const line = usableLines[i];
@@ -804,6 +850,7 @@ async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
       continue;
     }
 
+    const inputIndex = addedCount + 1;
     inputArgs.push("-i", speechPath);
 
     const delayMs = Math.max(
@@ -813,12 +860,13 @@ async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
     const volume = Number(line.volume ?? 1);
 
     filterParts.push(
-      `[${mixInputs.length}:a]adelay=${delayMs}|${delayMs},volume=${volume}[a${mixInputs.length}]`
+      `[${inputIndex}:a]adelay=${delayMs}|${delayMs},volume=${volume}[a${inputIndex}]`
     );
-    mixInputs.push(`[a${mixInputs.length}]`);
+    mixInputs.push(`[a${inputIndex}]`);
+    addedCount += 1;
   }
 
-  if (mixInputs.length === 1) {
+  if (addedCount === 0) {
     return silentBase;
   }
 
@@ -840,15 +888,13 @@ async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
     outputPath,
   ]);
 
+  console.log(`Dialogue scene ${sceneIndex + 1}: mixed ${addedCount} line(s)`);
+
   return outputPath;
 }
 
 async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
-  const effects =
-    Array.isArray(scene?.sound_effects) && scene.sound_effects.length
-      ? scene.sound_effects
-      : buildSimpleFallbackSoundEffects(scene);
-
+  const effects = resolveSceneSoundEffects(scene);
   const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
 
   const silentBase = path.join(tmpDir, `scene-${sceneIndex}-sfx-base.m4a`);
@@ -856,23 +902,24 @@ async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
 
   console.log(`SFX scene ${sceneIndex + 1}:`, {
     enableGeneratedSfx: ENABLE_GENERATED_SFX,
+    enableAutoSfxInference: ENABLE_AUTO_SFX_INFERENCE,
     hasElevenLabsKey: Boolean(ELEVENLABS_API_KEY),
     requestedEffects: effects.length,
     effects,
   });
 
   if (!effects.length) {
-    console.log(`SFX scene ${sceneIndex + 1}: no effects requested, using silence`);
+    console.log(`SFX scene ${sceneIndex + 1}: no effects requested`);
     return silentBase;
   }
 
   if (!ENABLE_GENERATED_SFX) {
-    console.log(`SFX scene ${sceneIndex + 1}: ENABLE_GENERATED_SFX is false, using silence`);
+    console.log(`SFX scene ${sceneIndex + 1}: ENABLE_GENERATED_SFX is false`);
     return silentBase;
   }
 
   if (!ELEVENLABS_API_KEY) {
-    console.log(`SFX scene ${sceneIndex + 1}: missing ELEVENLABS_API_KEY, using silence`);
+    console.log(`SFX scene ${sceneIndex + 1}: missing ELEVENLABS_API_KEY`);
     return silentBase;
   }
 
@@ -920,7 +967,7 @@ async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
   }
 
   if (!usableEffects.length) {
-    console.log(`SFX scene ${sceneIndex + 1}: all SFX failed, using silence`);
+    console.log(`SFX scene ${sceneIndex + 1}: all SFX failed`);
     return silentBase;
   }
 
@@ -1003,7 +1050,7 @@ async function buildFinalAudioTrack({
 
     if (sfxPath) {
       inputs.push("-i", sfxPath);
-      mixParts.push(`[${inputIndex}:a]volume=1.0[a${inputIndex}]`);
+      mixParts.push(`[${inputIndex}:a]volume=0.8[a${inputIndex}]`);
       mixInputs.push(`[a${inputIndex}]`);
       inputIndex++;
     }
@@ -1060,7 +1107,7 @@ async function buildFinalAudioTrack({
       "-i",
       narrationPath,
       "-filter_complex",
-      "[0:a]volume=1.0[scene];[1:a]volume=0.35[narr];[scene][narr]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
+      "[0:a]volume=1.0[scene];[1:a]volume=0.55[narr];[scene][narr]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
       "-map",
       "[aout]",
       "-c:a",
@@ -1252,7 +1299,7 @@ async function mergeVideoWithFinalAudio({
       backgroundMusicPath,
       "-filter_complex",
       `[0:a]volume=1.0[videoaud];` +
-        `[1:a]volume=0.45[main];` +
+        `[1:a]volume=1.0[main];` +
         `[2:a]volume=${bgmVolume}[bgm];` +
         `[videoaud][main][bgm]amix=inputs=3:duration=first:dropout_transition=2[aout]`,
       "-map",
@@ -1278,7 +1325,7 @@ async function mergeVideoWithFinalAudio({
       finalAudioPath,
       "-filter_complex",
       `[0:a]volume=1.0[videoaud];` +
-        `[1:a]volume=0.45[main];` +
+        `[1:a]volume=1.0[main];` +
         `[videoaud][main]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
       "-map",
       "0:v:0",
@@ -1505,27 +1552,27 @@ app.post("/render", async (req, res) => {
     });
 
     try {
-  await mergeVideoWithFinalAudio({
-    videoPath: videoForAudio,
-    finalAudioPath,
-    outputPath: finalVideoPath,
-    backgroundMusicPath: BACKGROUND_MUSIC_PATH,
-    bgmVolume: BGM_VOLUME,
-  });
-} catch (bgmErr) {
-  console.error(
-    "Final merge with background music failed, retrying without BGM:",
-    bgmErr?.message || bgmErr
-  );
+      await mergeVideoWithFinalAudio({
+        videoPath: videoForAudio,
+        finalAudioPath,
+        outputPath: finalVideoPath,
+        backgroundMusicPath: BACKGROUND_MUSIC_PATH,
+        bgmVolume: BGM_VOLUME,
+      });
+    } catch (bgmErr) {
+      console.error(
+        "Final merge with background music failed, retrying without BGM:",
+        bgmErr?.message || bgmErr
+      );
 
-  await mergeVideoWithFinalAudio({
-    videoPath: videoForAudio,
-    finalAudioPath,
-    outputPath: finalVideoPath,
-    backgroundMusicPath: "",
-    bgmVolume: BGM_VOLUME,
-  });
-}
+      await mergeVideoWithFinalAudio({
+        videoPath: videoForAudio,
+        finalAudioPath,
+        outputPath: finalVideoPath,
+        backgroundMusicPath: "",
+        bgmVolume: BGM_VOLUME,
+      });
+    }
 
     await updateExport(exportId, {
       progress: 96,
