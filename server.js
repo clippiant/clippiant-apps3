@@ -41,7 +41,10 @@ const ENABLE_GENERATED_SFX =
   String(process.env.ENABLE_GENERATED_SFX || "true") === "true";
 
 const ENABLE_AUTO_SFX_INFERENCE =
-  String(process.env.ENABLE_AUTO_SFX_INFERENCE || "false") === "true";
+  String(process.env.ENABLE_AUTO_SFX_INFERENCE || "true") === "true";
+
+const ENABLE_AI_AUDIO_PLANNER =
+  String(process.env.ENABLE_AI_AUDIO_PLANNER || "true") === "true";
 
 const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH
   ? path.resolve(process.cwd(), process.env.BACKGROUND_MUSIC_PATH)
@@ -49,9 +52,6 @@ const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH
 
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.03");
 const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
-
-const ENABLE_AI_AUDIO_PLANNER =
-  String(process.env.ENABLE_AI_AUDIO_PLANNER || "true") === "true";
 
 const PROVIDER_CONFIG = {
   video: {
@@ -92,23 +92,34 @@ console.log("RUNWAY ENV CHECK:", {
     ? process.env.RUNWAYML_API_SECRET.slice(0, 4)
     : null,
 });
+
 console.log("RUNWAY CLIENT AVAILABLE:", Boolean(runway));
+
 console.log("PIKA ENV CHECK:", {
   hasFalKey: Boolean(process.env.FAL_KEY),
   endpoint: PIKA_ENDPOINT,
 });
+
 console.log("BGM ENV CHECK:", {
   configuredPath: process.env.BACKGROUND_MUSIC_PATH || null,
   resolvedPath: BACKGROUND_MUSIC_PATH || null,
   exists: BACKGROUND_MUSIC_PATH ? fs.existsSync(BACKGROUND_MUSIC_PATH) : false,
 });
+
 console.log("APP ROOT CONTENTS:", fs.readdirSync(process.cwd()));
+
 console.log(
   "ASSETS CONTENTS:",
   fs.existsSync(path.join(process.cwd(), "assets"))
     ? fs.readdirSync(path.join(process.cwd(), "assets"))
     : "assets folder missing"
 );
+
+console.log("AI AUDIO PLANNER CHECK:", {
+  ENABLE_AI_AUDIO_PLANNER,
+  ENABLE_GENERATED_SFX,
+  ENABLE_AUTO_SFX_INFERENCE,
+});
 
 function requireSecret(req, res) {
   if (!WORKER_SECRET) {
@@ -938,7 +949,10 @@ async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
     );
 
     try {
-      console.log(`Generating SFX for scene ${sceneIndex + 1}, effect ${i + 1}:`, fx.prompt);
+      console.log(
+        `Generating SFX for scene ${sceneIndex + 1}, effect ${i + 1}:`,
+        fx.prompt
+      );
 
       await generateSoundEffectToFile({
         prompt: fx.prompt,
@@ -1643,13 +1657,31 @@ async function generateAiAudioPlanForScene({
   const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
 
   const existingDialogue =
-    Array.isArray(scene?.dialogue) && scene.dialogue.some((line) => line?.text?.trim?.());
+    Array.isArray(scene?.dialogue) &&
+    scene.dialogue.some(
+      (line) => typeof line?.text === "string" && line.text.trim()
+    );
+
   const existingSfx =
     Array.isArray(scene?.sound_effects) &&
-    scene.sound_effects.some((fx) => fx?.prompt?.trim?.());
+    scene.sound_effects.some(
+      (fx) => typeof fx?.prompt === "string" && fx.prompt.trim()
+    );
 
-  const shouldPlanDialogue = !existingDialogue && shouldAutoPlanDialogueForScene(scene, audioMode);
-  const shouldPlanSfx = !existingSfx && shouldAutoPlanSfxForScene(scene);
+  // Debug-friendly: try much more aggressively than before.
+  const shouldPlanDialogue =
+    !existingDialogue && (audioMode === "dialogue" || audioMode === "both");
+  const shouldPlanSfx = !existingSfx;
+
+  console.log("AI AUDIO PLANNER DECISION:", {
+    sceneIndex: sceneIndex + 1,
+    title: scene?.title || "",
+    existingDialogue,
+    existingSfx,
+    shouldPlanDialogue,
+    shouldPlanSfx,
+    audioMode,
+  });
 
   if (!shouldPlanDialogue && !shouldPlanSfx) {
     return {
@@ -1667,10 +1699,18 @@ async function generateAiAudioPlanForScene({
     projectScript,
   });
 
+  console.log("AI AUDIO PROMPT START:", {
+    sceneIndex: sceneIndex + 1,
+    title: scene?.title || "",
+    audioMode,
+  });
+
   const response = await openai.responses.create({
     model: "gpt-5-mini",
     input: prompt,
   });
+
+  console.log("AI AUDIO RAW OUTPUT:", response.output_text || "");
 
   const text = response.output_text || "";
   const parsed = extractJsonFromText(text);
@@ -1696,6 +1736,12 @@ async function enrichScenesWithAi({
   projectTitle,
   projectScript,
 }) {
+  console.log("ENRICH SCENES START:", {
+    enabled: ENABLE_AI_AUDIO_PLANNER,
+    audioMode,
+    sceneCount: scenes.length,
+  });
+
   if (!ENABLE_AI_AUDIO_PLANNER) {
     return scenes;
   }
@@ -1704,6 +1750,8 @@ async function enrichScenesWithAi({
 
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
+
+    console.log(`PLANNER INPUT SCENE ${i + 1}:`, JSON.stringify(scene, null, 2));
 
     try {
       const aiPlan = await generateAiAudioPlanForScene({
@@ -1715,7 +1763,9 @@ async function enrichScenesWithAi({
         projectScript,
       });
 
-      enrichedScenes.push({
+      console.log(`PLANNER OUTPUT SCENE ${i + 1}:`, JSON.stringify(aiPlan, null, 2));
+
+      const enrichedScene = {
         ...scene,
         dialogue:
           Array.isArray(scene?.dialogue) && scene.dialogue.length
@@ -1725,7 +1775,14 @@ async function enrichScenesWithAi({
           Array.isArray(scene?.sound_effects) && scene.sound_effects.length
             ? scene.sound_effects
             : aiPlan.sound_effects,
-      });
+      };
+
+      enrichedScenes.push(enrichedScene);
+
+      console.log(
+        `FINAL ENRICHED SCENE ${i + 1}:`,
+        JSON.stringify(enrichedScene, null, 2)
+      );
     } catch (err) {
       console.error(
         `AI audio planner failed for scene ${i + 1}, using original scene data:`,
@@ -1785,31 +1842,31 @@ app.post("/render", async (req, res) => {
     }
 
     let scenes = normalizeScenes(project);
-if (scenes.length > MAX_SCENES_PER_EXPORT) {
-  scenes = scenes.slice(0, MAX_SCENES_PER_EXPORT);
-}
+    if (scenes.length > MAX_SCENES_PER_EXPORT) {
+      scenes = scenes.slice(0, MAX_SCENES_PER_EXPORT);
+    }
 
-const audioMode = getAudioMode(job, project);
+    const audioMode = getAudioMode(job, project);
 
-scenes = await enrichScenesWithAi({
-  scenes,
-  audioMode,
-  projectTitle: project.title || "",
-  projectScript: project.script || "",
-});
+    scenes = await enrichScenesWithAi({
+      scenes,
+      audioMode,
+      projectTitle: project.title || "",
+      projectScript: project.script || "",
+    });
 
-console.log(
-  "AI ENRICHED SCENES:",
-  JSON.stringify(
-    scenes.map((scene) => ({
-      title: scene.title,
-      dialogue: scene.dialogue,
-      sound_effects: scene.sound_effects,
-    })),
-    null,
-    2
-  )
-);
+    console.log(
+      "AI ENRICHED SCENES:",
+      JSON.stringify(
+        scenes.map((scene) => ({
+          title: scene.title,
+          dialogue: scene.dialogue,
+          sound_effects: scene.sound_effects,
+        })),
+        null,
+        2
+      )
+    );
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clippiant-"));
 
