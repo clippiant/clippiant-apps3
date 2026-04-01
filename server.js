@@ -1504,13 +1504,28 @@ app.post("/render", async (req, res) => {
       stage: "adding_audio",
     });
 
-    await mergeVideoWithFinalAudio({
-      videoPath: videoForAudio,
-      finalAudioPath,
-      outputPath: finalVideoPath,
-      backgroundMusicPath: BACKGROUND_MUSIC_PATH,
-      bgmVolume: BGM_VOLUME,
-    });
+    try {
+  await mergeVideoWithFinalAudio({
+    videoPath: videoForAudio,
+    finalAudioPath,
+    outputPath: finalVideoPath,
+    backgroundMusicPath: BACKGROUND_MUSIC_PATH,
+    bgmVolume: BGM_VOLUME,
+  });
+} catch (bgmErr) {
+  console.error(
+    "Final merge with background music failed, retrying without BGM:",
+    bgmErr?.message || bgmErr
+  );
+
+  await mergeVideoWithFinalAudio({
+    videoPath: videoForAudio,
+    finalAudioPath,
+    outputPath: finalVideoPath,
+    backgroundMusicPath: "",
+    bgmVolume: BGM_VOLUME,
+  });
+}
 
     await updateExport(exportId, {
       progress: 96,
