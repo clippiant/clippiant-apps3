@@ -50,6 +50,9 @@ const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.03");
 const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
 
+const ENABLE_AI_AUDIO_PLANNER =
+  String(process.env.ENABLE_AI_AUDIO_PLANNER || "true") === "true";
+
 const PROVIDER_CONFIG = {
   video: {
     primary: "runway",
@@ -1389,6 +1392,353 @@ async function mergeVideoWithFinalAudio({
   ]);
 }
 
+function extractJsonFromText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    throw new Error("AI audio planner returned empty text");
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start !== -1 && end !== -1 && end > start) {
+      return JSON.parse(raw.slice(start, end + 1));
+    }
+    throw new Error(`AI audio planner returned non-JSON text: ${raw}`);
+  }
+}
+
+function sanitizeDialogueLine(line, durationSeconds, index = 0) {
+  const safeDuration = Math.max(1, Number(durationSeconds) || DEFAULT_SCENE_SECONDS);
+
+  return {
+    speaker:
+      typeof line?.speaker === "string" && line.speaker.trim()
+        ? line.speaker.trim()
+        : `Speaker ${index + 1}`,
+    voice:
+      typeof line?.voice === "string" && line.voice.trim() ? line.voice.trim() : "",
+    text:
+      typeof line?.text === "string" && line.text.trim() ? line.text.trim() : "",
+    start_seconds: Math.max(
+      0,
+      Math.min(safeDuration - 0.1, Number(line?.start_seconds) || 0)
+    ),
+    volume: Math.max(0, Math.min(2, Number(line?.volume) || 1)),
+  };
+}
+
+function sanitizeSoundEffect(effect, durationSeconds) {
+  const safeDuration = Math.max(1, Number(durationSeconds) || DEFAULT_SCENE_SECONDS);
+  const start = Math.max(
+    0,
+    Math.min(safeDuration - 0.1, Number(effect?.start_seconds) || 0)
+  );
+
+  const maxRemaining = Math.max(0.5, safeDuration - start);
+
+  return {
+    prompt:
+      typeof effect?.prompt === "string" && effect.prompt.trim()
+        ? effect.prompt.trim()
+        : "",
+    start_seconds: start,
+    duration_seconds: Math.max(
+      0.5,
+      Math.min(maxRemaining, Number(effect?.duration_seconds) || 1.5)
+    ),
+    volume: Math.max(0, Math.min(2, Number(effect?.volume) || 0.8)),
+  };
+}
+
+function sanitizeAiAudioPlan(plan, durationSeconds) {
+  const safePlan = plan && typeof plan === "object" ? plan : {};
+
+  const dialogue = Array.isArray(safePlan.dialogue)
+    ? safePlan.dialogue
+        .map((line, index) => sanitizeDialogueLine(line, durationSeconds, index))
+        .filter((line) => line.text)
+        .slice(0, 2)
+    : [];
+
+  const sound_effects = Array.isArray(safePlan.sound_effects)
+    ? safePlan.sound_effects
+        .map((effect) => sanitizeSoundEffect(effect, durationSeconds))
+        .filter((effect) => effect.prompt)
+        .slice(0, 2)
+    : [];
+
+  return {
+    dialogue,
+    sound_effects,
+  };
+}
+
+function shouldAutoPlanDialogueForScene(scene, audioMode) {
+  if (!(audioMode === "dialogue" || audioMode === "both")) {
+    return false;
+  }
+
+  const sceneText = [
+    scene?.title || "",
+    scene?.narration || "",
+    scene?.base_prompt || "",
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const speakingHints = [
+    "says",
+    "asks",
+    "replies",
+    "talks",
+    "speaks",
+    "conversation",
+    "interview",
+    "phone call",
+    "meeting",
+    "debate",
+    "discussion",
+    "argues",
+    "whispers",
+    "shouts",
+    "tells",
+  ];
+
+  return speakingHints.some((hint) => sceneText.includes(hint));
+}
+
+function shouldAutoPlanSfxForScene(scene) {
+  const sceneText = [
+    scene?.title || "",
+    scene?.narration || "",
+    scene?.base_prompt || "",
+    scene?.background || "",
+    ...(Array.isArray(scene?.props) ? scene.props : []),
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const sfxHints = [
+    "walk",
+    "footstep",
+    "run",
+    "door",
+    "typing",
+    "keyboard",
+    "coffee",
+    "cup",
+    "mug",
+    "street",
+    "traffic",
+    "city",
+    "forest",
+    "park",
+    "rain",
+    "kitchen",
+    "cook",
+    "phone",
+    "click",
+    "mouse",
+    "car",
+    "engine",
+    "applause",
+    "crowd",
+    "office",
+  ];
+
+  return sfxHints.some((hint) => sceneText.includes(hint));
+}
+
+function buildAudioPlannerPrompt({
+  scene,
+  sceneIndex,
+  totalScenes,
+  audioMode,
+  projectTitle,
+  projectScript,
+}) {
+  const duration = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
+
+  return `
+You are planning missing audio for an AI-generated video scene.
+
+Your job:
+- Keep user-provided dialogue if it already exists.
+- Keep user-provided sound_effects if they already exist.
+- Only fill missing dialogue and/or missing sound_effects.
+- Be conservative.
+- Maximum 2 dialogue lines.
+- Maximum 2 sound effects.
+- Only add dialogue if speaking is clearly appropriate.
+- Only add sound effects that match visible actions or obvious ambience.
+- Keep everything cinematic and uncluttered.
+
+Project title:
+${projectTitle || ""}
+
+Project script:
+${projectScript || ""}
+
+Scene ${sceneIndex + 1} of ${totalScenes}
+Title: ${scene?.title || ""}
+Narration: ${scene?.narration || ""}
+Base prompt: ${scene?.base_prompt || ""}
+Continuity rules: ${scene?.continuity_rules || ""}
+Characters: ${Array.isArray(scene?.characters) ? scene.characters.join(", ") : ""}
+Props: ${Array.isArray(scene?.props) ? scene.props.join(", ") : ""}
+Background: ${scene?.background || ""}
+Video style: ${scene?.video_style || ""}
+Duration seconds: ${duration}
+Audio mode: ${audioMode}
+
+Existing dialogue:
+${JSON.stringify(Array.isArray(scene?.dialogue) ? scene.dialogue : [], null, 2)}
+
+Existing sound_effects:
+${JSON.stringify(Array.isArray(scene?.sound_effects) ? scene.sound_effects : [], null, 2)}
+
+Return JSON only in this exact shape:
+{
+  "dialogue": [
+    {
+      "speaker": "string",
+      "voice": "",
+      "text": "string",
+      "start_seconds": number,
+      "volume": number
+    }
+  ],
+  "sound_effects": [
+    {
+      "prompt": "string",
+      "start_seconds": number,
+      "duration_seconds": number,
+      "volume": number
+    }
+  ]
+}
+
+Rules:
+- If existing dialogue is already present, return it unchanged.
+- If existing sound_effects are already present, return them unchanged.
+- If dialogue should remain empty, return "dialogue": [].
+- If sound effects should remain empty, return "sound_effects": [].
+- Dialogue should be short, natural, and minimal.
+- Sound effects should sound like real film/audio post-production cues.
+- Keep timestamps inside the scene duration.
+`.trim();
+}
+
+async function generateAiAudioPlanForScene({
+  scene,
+  sceneIndex,
+  totalScenes,
+  audioMode,
+  projectTitle,
+  projectScript,
+}) {
+  const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
+
+  const existingDialogue =
+    Array.isArray(scene?.dialogue) && scene.dialogue.some((line) => line?.text?.trim?.());
+  const existingSfx =
+    Array.isArray(scene?.sound_effects) &&
+    scene.sound_effects.some((fx) => fx?.prompt?.trim?.());
+
+  const shouldPlanDialogue = !existingDialogue && shouldAutoPlanDialogueForScene(scene, audioMode);
+  const shouldPlanSfx = !existingSfx && shouldAutoPlanSfxForScene(scene);
+
+  if (!shouldPlanDialogue && !shouldPlanSfx) {
+    return {
+      dialogue: Array.isArray(scene?.dialogue) ? scene.dialogue : [],
+      sound_effects: Array.isArray(scene?.sound_effects) ? scene.sound_effects : [],
+    };
+  }
+
+  const prompt = buildAudioPlannerPrompt({
+    scene,
+    sceneIndex,
+    totalScenes,
+    audioMode,
+    projectTitle,
+    projectScript,
+  });
+
+  const response = await openai.responses.create({
+    model: "gpt-5-mini",
+    input: prompt,
+  });
+
+  const text = response.output_text || "";
+  const parsed = extractJsonFromText(text);
+  const sanitized = sanitizeAiAudioPlan(parsed, durationSeconds);
+
+  return {
+    dialogue: existingDialogue
+      ? Array.isArray(scene?.dialogue)
+        ? scene.dialogue
+        : []
+      : sanitized.dialogue,
+    sound_effects: existingSfx
+      ? Array.isArray(scene?.sound_effects)
+        ? scene.sound_effects
+        : []
+      : sanitized.sound_effects,
+  };
+}
+
+async function enrichScenesWithAi({
+  scenes,
+  audioMode,
+  projectTitle,
+  projectScript,
+}) {
+  if (!ENABLE_AI_AUDIO_PLANNER) {
+    return scenes;
+  }
+
+  const enrichedScenes = [];
+
+  for (let i = 0; i < scenes.length; i++) {
+    const scene = scenes[i];
+
+    try {
+      const aiPlan = await generateAiAudioPlanForScene({
+        scene,
+        sceneIndex: i,
+        totalScenes: scenes.length,
+        audioMode,
+        projectTitle,
+        projectScript,
+      });
+
+      enrichedScenes.push({
+        ...scene,
+        dialogue:
+          Array.isArray(scene?.dialogue) && scene.dialogue.length
+            ? scene.dialogue
+            : aiPlan.dialogue,
+        sound_effects:
+          Array.isArray(scene?.sound_effects) && scene.sound_effects.length
+            ? scene.sound_effects
+            : aiPlan.sound_effects,
+      });
+    } catch (err) {
+      console.error(
+        `AI audio planner failed for scene ${i + 1}, using original scene data:`,
+        err?.message || err
+      );
+
+      enrichedScenes.push(scene);
+    }
+  }
+
+  return enrichedScenes;
+}
+
 app.get("/", (_req, res) => {
   res.send("clippiant-worker ok");
 });
@@ -1435,11 +1785,31 @@ app.post("/render", async (req, res) => {
     }
 
     let scenes = normalizeScenes(project);
-    if (scenes.length > MAX_SCENES_PER_EXPORT) {
-      scenes = scenes.slice(0, MAX_SCENES_PER_EXPORT);
-    }
+if (scenes.length > MAX_SCENES_PER_EXPORT) {
+  scenes = scenes.slice(0, MAX_SCENES_PER_EXPORT);
+}
 
-    const audioMode = getAudioMode(job, project);
+const audioMode = getAudioMode(job, project);
+
+scenes = await enrichScenesWithAi({
+  scenes,
+  audioMode,
+  projectTitle: project.title || "",
+  projectScript: project.script || "",
+});
+
+console.log(
+  "AI ENRICHED SCENES:",
+  JSON.stringify(
+    scenes.map((scene) => ({
+      title: scene.title,
+      dialogue: scene.dialogue,
+      sound_effects: scene.sound_effects,
+    })),
+    null,
+    2
+  )
+);
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clippiant-"));
 
