@@ -261,6 +261,30 @@ function selectOpenAIVoiceForSpeaker(speaker) {
   return voices[index];
 }
 
+function normalizeSpeakerKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function createVoiceRegistry() {
+  return new Map();
+}
+
+function getStableVoiceForSpeaker(voiceRegistry, speaker) {
+  const fallbackKey = "default";
+  const key = normalizeSpeakerKey(speaker) || fallbackKey;
+
+  if (voiceRegistry.has(key)) {
+    return voiceRegistry.get(key);
+  }
+
+  const voice = selectOpenAIVoiceForSpeaker(key);
+  voiceRegistry.set(key, voice);
+  return voice;
+}
+
 function normalizeStringList(value) {
   if (!Array.isArray(value)) return [];
   return value
@@ -826,7 +850,12 @@ async function generateSoundEffectToFile({
   });
 }
 
-async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
+async function buildSceneDialogueTrack({
+  scene,
+  sceneIndex,
+  tmpDir,
+  voiceRegistry,
+}) {
   const lines = Array.isArray(scene?.dialogue) ? scene.dialogue : [];
   const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
 
@@ -857,7 +886,10 @@ async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
     const speechPath = path.join(tmpDir, `scene-${sceneIndex}-dialogue-${i}.mp3`);
 
     const speaker = line.speaker || `Speaker ${i + 1}`;
-    const voice = line.voice || selectOpenAIVoiceForSpeaker(speaker);
+    const voice =
+      line.voice && String(line.voice).trim()
+        ? String(line.voice).trim()
+        : getStableVoiceForSpeaker(voiceRegistry, speaker);
 
     try {
       await synthesizeSpeechToFile({
@@ -1088,13 +1120,19 @@ async function buildFinalAudioTrack({
   transitionDuration,
 }) {
   const sceneFinalTracks = [];
+  const voiceRegistry = createVoiceRegistry();
 
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
     const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
 
     const dialoguePath = shouldGenerateDialogue(audioMode)
-      ? await buildSceneDialogueTrack({ scene, sceneIndex: i, tmpDir })
+      ? await buildSceneDialogueTrack({
+          scene,
+          sceneIndex: i,
+          tmpDir,
+          voiceRegistry,
+        })
       : null;
 
     const sfxPath = await buildSceneSfxTrack({ scene, sceneIndex: i, tmpDir });
