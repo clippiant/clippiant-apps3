@@ -1031,13 +1031,34 @@ async function buildSceneSfxTrack({ scene, sceneIndex, tmpDir }) {
   return outputPath;
 }
 
+function computeSceneTimelineStarts(scenes, transitionDuration) {
+  const starts = [];
+  let cursor = 0;
+
+  for (let i = 0; i < scenes.length; i++) {
+    starts.push(cursor);
+    const duration = Number(scenes[i]?.duration_seconds || DEFAULT_SCENE_SECONDS);
+    cursor += duration;
+    if (i < scenes.length - 1) {
+      cursor -= transitionDuration;
+    }
+  }
+
+  return {
+    starts,
+    totalDuration: Math.max(0, cursor),
+  };
+}
+
+// FIXED: build one audio timeline that matches video crossfade timing.
 async function buildFinalAudioTrack({
   audioMode,
   narrationPath,
   scenes,
   tmpDir,
+  transitionDuration,
 }) {
-  const sceneAudioPaths = [];
+  const sceneFinalTracks = [];
 
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
@@ -1055,7 +1076,6 @@ async function buildFinalAudioTrack({
     const inputs = ["-i", sceneBase];
     const mixParts = ["[0:a]volume=1.0[a0]"];
     const mixInputs = ["[a0]"];
-
     let inputIndex = 1;
 
     if (dialoguePath) {
@@ -1090,28 +1110,54 @@ async function buildFinalAudioTrack({
       sceneOutput,
     ]);
 
-    sceneAudioPaths.push(sceneOutput);
+    sceneFinalTracks.push(sceneOutput);
   }
 
-  const concatList = path.join(tmpDir, "scene-audio-list.txt");
-  fs.writeFileSync(
-    concatList,
-    sceneAudioPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n")
+  const { starts, totalDuration } = computeSceneTimelineStarts(
+    scenes,
+    transitionDuration
   );
 
-  const combinedSceneAudio = path.join(tmpDir, "combined-scene-audio.m4a");
+  console.log("AUDIO TIMELINE:", {
+    starts,
+    totalDuration,
+    transitionDuration,
+  });
+
+  const timelineBase = path.join(tmpDir, "timeline-base.m4a");
+  await createSilentAudio(timelineBase, totalDuration || 0.5);
+
+  const masterInputs = ["-i", timelineBase];
+  const masterFilterParts = ["[0:a]volume=1.0[a0]"];
+  const masterMixInputs = ["[a0]"];
+
+  for (let i = 0; i < sceneFinalTracks.length; i++) {
+    masterInputs.push("-i", sceneFinalTracks[i]);
+    const delayMs = Math.max(0, Math.floor((starts[i] || 0) * 1000));
+    const inputIndex = i + 1;
+
+    masterFilterParts.push(
+      `[${inputIndex}:a]adelay=${delayMs}|${delayMs}[a${inputIndex}]`
+    );
+    masterMixInputs.push(`[a${inputIndex}]`);
+  }
+
+  const timelineAudio = path.join(tmpDir, "timeline-scenes-audio.m4a");
+  const timelineFilter = [
+    ...masterFilterParts,
+    `${masterMixInputs.join("")}amix=inputs=${masterMixInputs.length}:duration=longest:dropout_transition=0[aout]`,
+  ].join(";");
 
   await runFfmpeg([
     "-y",
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    concatList,
-    "-c",
-    "copy",
-    combinedSceneAudio,
+    ...masterInputs,
+    "-filter_complex",
+    timelineFilter,
+    "-map",
+    "[aout]",
+    "-c:a",
+    "aac",
+    timelineAudio,
   ]);
 
   if (shouldGenerateNarration(audioMode) && narrationPath && fs.existsSync(narrationPath)) {
@@ -1120,7 +1166,7 @@ async function buildFinalAudioTrack({
     await runFfmpeg([
       "-y",
       "-i",
-      combinedSceneAudio,
+      timelineAudio,
       "-i",
       narrationPath,
       "-filter_complex",
@@ -1135,7 +1181,7 @@ async function buildFinalAudioTrack({
     return finalAudio;
   }
 
-  return combinedSceneAudio;
+  return timelineAudio;
 }
 
 async function mergeSceneClipsWithTransitions(
@@ -1490,82 +1536,6 @@ function sanitizeAiAudioPlan(plan, durationSeconds) {
   };
 }
 
-function shouldAutoPlanDialogueForScene(scene, audioMode) {
-  if (!(audioMode === "dialogue" || audioMode === "both")) {
-    return false;
-  }
-
-  const sceneText = [
-    scene?.title || "",
-    scene?.narration || "",
-    scene?.base_prompt || "",
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  const speakingHints = [
-    "says",
-    "asks",
-    "replies",
-    "talks",
-    "speaks",
-    "conversation",
-    "interview",
-    "phone call",
-    "meeting",
-    "debate",
-    "discussion",
-    "argues",
-    "whispers",
-    "shouts",
-    "tells",
-  ];
-
-  return speakingHints.some((hint) => sceneText.includes(hint));
-}
-
-function shouldAutoPlanSfxForScene(scene) {
-  const sceneText = [
-    scene?.title || "",
-    scene?.narration || "",
-    scene?.base_prompt || "",
-    scene?.background || "",
-    ...(Array.isArray(scene?.props) ? scene.props : []),
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  const sfxHints = [
-    "walk",
-    "footstep",
-    "run",
-    "door",
-    "typing",
-    "keyboard",
-    "coffee",
-    "cup",
-    "mug",
-    "street",
-    "traffic",
-    "city",
-    "forest",
-    "park",
-    "rain",
-    "kitchen",
-    "cook",
-    "phone",
-    "click",
-    "mouse",
-    "car",
-    "engine",
-    "applause",
-    "crowd",
-    "office",
-  ];
-
-  return sfxHints.some((hint) => sceneText.includes(hint));
-}
-
 function buildAudioPlannerPrompt({
   scene,
   sceneIndex,
@@ -1634,15 +1604,6 @@ Return JSON only in this exact shape:
     }
   ]
 }
-
-Rules:
-- If existing dialogue is already present, return it unchanged.
-- If existing sound_effects are already present, return them unchanged.
-- If dialogue should remain empty, return "dialogue": [].
-- If sound effects should remain empty, return "sound_effects": [].
-- Dialogue should be short, natural, and minimal.
-- Sound effects should sound like real film/audio post-production cues.
-- Keep timestamps inside the scene duration.
 `.trim();
 }
 
@@ -1668,7 +1629,6 @@ async function generateAiAudioPlanForScene({
       (fx) => typeof fx?.prompt === "string" && fx.prompt.trim()
     );
 
-  // Debug-friendly: try much more aggressively than before.
   const shouldPlanDialogue =
     !existingDialogue && (audioMode === "dialogue" || audioMode === "both");
   const shouldPlanSfx = !existingSfx;
@@ -1969,6 +1929,7 @@ app.post("/render", async (req, res) => {
       narrationPath,
       scenes,
       tmpDir,
+      transitionDuration: TRANSITION_DURATION,
     });
 
     fs.copyFileSync(builtAudioPath, finalAudioPath);
