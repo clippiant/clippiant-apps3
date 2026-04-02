@@ -398,7 +398,7 @@ function buildSceneVideoPrompt(scene, sceneIndex, totalScenes, previousScene = n
 
   const strictContinuity = buildStrictContinuityBlock(scene, previousScene);
 
-  const prompt = [
+  const parts = [
     `Scene ${sceneIndex + 1} of ${totalScenes}.`,
     strictContinuity,
     scene?.base_prompt || "",
@@ -406,14 +406,19 @@ function buildSceneVideoPrompt(scene, sceneIndex, totalScenes, previousScene = n
     scene?.narration ? `Scene context: ${scene.narration}` : "",
     dialogueSummary ? `Dialogue context: ${dialogueSummary}` : "",
     sfxSummary ? `Action/audio cues: ${sfxSummary}` : "",
-    "Output a single coherent cinematic video shot with stable subject identity, stable wardrobe, stable props, stable environment, stable lighting, natural motion, and no subtitles or on-screen text.",
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+  ];
 
-  return prompt;
+  if (dialogueSummary) {
+    parts.push(
+      "The main subject is visibly speaking. Show subtle mouth movement, natural talking behavior, visible face framing, and a medium close-up or close shot when appropriate."
+    );
+  }
+
+  parts.push(
+    "Output a single coherent cinematic video shot with stable subject identity, stable wardrobe, stable props, stable environment, stable lighting, natural motion, and no subtitles or on-screen text."
+  );
+
+  return parts.filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 }
 
 function getNarrationText(project, scenes) {
@@ -829,7 +834,6 @@ async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
   await createSilentAudio(silentBase, durationSeconds);
 
   if (!lines.length) {
-    console.log(`Dialogue scene ${sceneIndex + 1}: no dialogue lines`);
     return silentBase;
   }
 
@@ -838,18 +842,20 @@ async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
   );
 
   if (!usableLines.length) {
-    console.log(`Dialogue scene ${sceneIndex + 1}: no usable dialogue lines`);
     return silentBase;
   }
 
   const inputArgs = ["-i", silentBase];
   const filterParts = ["[0:a]volume=1.0[a0]"];
   const mixInputs = ["[a0]"];
+
   let addedCount = 0;
+  let currentTime = 0;
 
   for (let i = 0; i < usableLines.length; i++) {
     const line = usableLines[i];
     const speechPath = path.join(tmpDir, `scene-${sceneIndex}-dialogue-${i}.mp3`);
+
     const speaker = line.speaker || `Speaker ${i + 1}`;
     const voice = line.voice || selectOpenAIVoiceForSpeaker(speaker);
 
@@ -860,24 +866,48 @@ async function buildSceneDialogueTrack({ scene, sceneIndex, tmpDir }) {
         outputPath: speechPath,
       });
     } catch (err) {
-      console.error(`Skipping failed dialogue line ${i}:`, err?.message || err);
+      console.error(`Skipping dialogue line ${i}:`, err?.message || err);
       continue;
     }
+
+    let realDuration = 0;
+    try {
+      realDuration = await getMediaDuration(speechPath);
+    } catch {
+      realDuration = 1.5;
+    }
+
+    let startTime =
+      typeof line.start_seconds === "number" && Number.isFinite(line.start_seconds)
+        ? line.start_seconds
+        : currentTime;
+
+    if (startTime < currentTime) {
+      startTime = currentTime;
+    }
+
+    if (startTime >= durationSeconds - 0.2) {
+      continue;
+    }
+
+    const maxAllowedDuration = Math.max(0.2, durationSeconds - startTime);
+    if (realDuration > maxAllowedDuration) {
+      realDuration = maxAllowedDuration;
+    }
+
+    const delayMs = Math.max(0, Math.floor(startTime * 1000));
+    const volume = Number(line.volume ?? 1);
 
     const inputIndex = addedCount + 1;
     inputArgs.push("-i", speechPath);
 
-    const delayMs = Math.max(
-      0,
-      Math.floor((Number(line.start_seconds) || 0) * 1000)
-    );
-    const volume = Number(line.volume ?? 1);
-
     filterParts.push(
-      `[${inputIndex}:a]adelay=${delayMs}|${delayMs},volume=${volume}[a${inputIndex}]`
+      `[${inputIndex}:a]atrim=0:${realDuration},adelay=${delayMs}|${delayMs},volume=${volume}[a${inputIndex}]`
     );
     mixInputs.push(`[a${inputIndex}]`);
     addedCount += 1;
+
+    currentTime = startTime + realDuration + 0.05;
   }
 
   if (addedCount === 0) {
@@ -1050,7 +1080,6 @@ function computeSceneTimelineStarts(scenes, transitionDuration) {
   };
 }
 
-// FIXED: build one audio timeline that matches video crossfade timing.
 async function buildFinalAudioTrack({
   audioMode,
   narrationPath,
